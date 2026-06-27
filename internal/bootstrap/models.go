@@ -12,6 +12,8 @@ import (
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/provider/compat"
 )
 
 // 长输出 + 长 ctx 场景下，reasoning-aware provider（mimo / deepseek-r1 等）
@@ -272,6 +274,15 @@ func createModelFromConfig(providerKey, model string, pc ProviderConfig, cache m
 		return m, nil
 	}
 
+	if modelImpl, ok, err := createOpenAICompatModel(providerKey, model, pc); ok {
+		if err != nil {
+			return nil, err
+		}
+		applyModelQuirks(providerKey, strings.ToLower(strings.TrimSpace(pc.Type)), model, pc, modelImpl)
+		cache[cacheKey] = modelImpl
+		return modelImpl, nil
+	}
+
 	providerType, err := pc.ProviderType(providerKey)
 	if err != nil {
 		return nil, fmt.Errorf("解析 provider 类型失败: %w", err)
@@ -289,6 +300,109 @@ func createModelFromConfig(providerKey, model string, pc ProviderConfig, cache m
 	}
 	cache[cacheKey] = m
 	return m, nil
+}
+
+func createOpenAICompatModel(providerKey, model string, pc ProviderConfig) (agentcore.ChatModel, bool, error) {
+	providerKey = strings.TrimSpace(providerKey)
+	if providerKey == "" {
+		return nil, false, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(pc.Type), "openai") {
+		return nil, false, nil
+	}
+	if llm.IsProviderRegistered(providerKey) {
+		return nil, false, nil
+	}
+
+	headers := mapStringAny(pc.Extra["headers"])
+	userAgent := stringValue(pc.Extra["user_agent"])
+	providerImpl, err := compat.New(compat.Config{
+		APIKey:                      strings.TrimSpace(pc.APIKey),
+		BaseURL:                     strings.TrimSpace(pc.BaseURL),
+		Headers:                     headers,
+		UserAgent:                   userAgent,
+		AllowUnknownProviderOptions: true,
+	}, compat.Spec{
+		Name: providerKey,
+		Auth: compat.AuthSpec{APIKeyRequired: strings.TrimSpace(pc.APIKey) != ""},
+		Response: compat.ResponseSpec{
+			ModelFromResponse:         true,
+			ReasoningFields:           []string{"reasoning_content"},
+			HasCompletionTokenDetails: true,
+		},
+		Stream: compat.StreamSpec{
+			ReasoningFields: []string{"reasoning_content"},
+		},
+	})
+	if err != nil {
+		return nil, true, fmt.Errorf("provider %s (openai compat): %w: %w", providerKey, errs.ErrProvider, err)
+	}
+
+	client, err := litellm.New(providerImpl, litellm.WithStreamIdleTimeout(streamIdleTimeout))
+	if err != nil {
+		return nil, true, fmt.Errorf("provider %s (openai compat): %w: %w", providerKey, errs.ErrProvider, err)
+	}
+	return llm.NewLiteLLMAdapter(model, client), true, nil
+}
+
+func mapStringAny(v any) map[string]string {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, raw := range m {
+		s, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		s = strings.TrimSpace(s)
+		if k == "" || s == "" {
+			continue
+		}
+		out[k] = s
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func stringValue(v any) string {
+	s, _ := v.(string)
+	return strings.TrimSpace(s)
+}
+
+func applyModelQuirks(providerKey, providerType, model string, pc ProviderConfig, chatModel agentcore.ChatModel) {
+	cfgModel, ok := chatModel.(interface{ GetConfig() *llm.GenerationConfig })
+	if !ok {
+		return
+	}
+	cfg := cfgModel.GetConfig()
+	if cfg == nil {
+		return
+	}
+
+	lowerModel := strings.ToLower(strings.TrimSpace(model))
+	lowerProvider := strings.ToLower(strings.TrimSpace(providerKey))
+	lowerType := strings.ToLower(strings.TrimSpace(providerType))
+	lowerBaseURL := strings.ToLower(strings.TrimSpace(pc.BaseURL))
+
+	if strings.HasPrefix(lowerModel, "kimi-") &&
+		(lowerProvider == "moonshot" ||
+			strings.Contains(lowerBaseURL, "moonshot.cn") ||
+			(strings.Contains(lowerBaseURL, "moonshot") && lowerType == "openai")) {
+		cfg.Temperature = 1
+		cfg.TopP = 0.95
+	}
+
+	if lowerProvider == "doubao" &&
+		strings.Contains(lowerBaseURL, "ark.cn-beijing.volces.com/api/v3") &&
+		strings.HasPrefix(lowerModel, "ep-") &&
+		cfg.MaxTokens > 32768 {
+		cfg.MaxTokens = 32768
+	}
 }
 
 type failoverModel struct {
