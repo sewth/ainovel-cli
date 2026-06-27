@@ -2,6 +2,8 @@ module github.com/voocel/ainovel-cli
 
 go 1.25.5
 
+replace github.com/voocel/agentcore => ../agentcore
+
 require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
