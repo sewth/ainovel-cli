@@ -12,6 +12,8 @@ import (
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/providers"
 )
 
 // 长输出 + 长 ctx 场景下，reasoning-aware provider（mimo / deepseek-r1 等）
@@ -265,9 +267,9 @@ func createModelFromConfig(providerKey, model string, pc ProviderConfig, cache m
 		return m, nil
 	}
 
-	providerType, err := pc.ProviderType(providerKey)
+	providerType, err := resolveProviderType(providerKey, pc)
 	if err != nil {
-		return nil, fmt.Errorf("解析 provider 类型失败: %w", err)
+		return nil, err
 	}
 
 	m, err := llm.NewModel(providerType, model,
@@ -280,8 +282,91 @@ func createModelFromConfig(providerKey, model string, pc ProviderConfig, cache m
 	if err != nil {
 		return nil, fmt.Errorf("provider %s (%s): %w: %w", providerKey, providerType, errs.ErrProvider, err)
 	}
+	applyModelQuirks(providerKey, providerType, model, pc, m)
 	cache[cacheKey] = m
 	return m, nil
+}
+
+func resolveProviderType(providerKey string, pc ProviderConfig) (string, error) {
+	providerKey = strings.TrimSpace(providerKey)
+	providerType := strings.ToLower(strings.TrimSpace(pc.Type))
+
+	if providerType == "openai" && providerKey != "" && !llm.IsProviderRegistered(providerKey) {
+		if err := registerOpenAICompatProvider(providerKey, pc.BaseURL); err != nil {
+			return "", fmt.Errorf("注册 OpenAI 兼容 provider %q 失败: %w", providerKey, err)
+		}
+		return providerKey, nil
+	}
+
+	resolved, err := pc.ProviderType(providerKey)
+	if err != nil {
+		return "", fmt.Errorf("解析 provider 类型失败: %w", err)
+	}
+	return resolved, nil
+}
+
+func registerOpenAICompatProvider(name, defaultBaseURL string) error {
+	name = strings.TrimSpace(name)
+	if name == "" || llm.IsProviderRegistered(name) {
+		return nil
+	}
+
+	compatName := strings.ToLower(name)
+	defaultBaseURL = strings.TrimSpace(defaultBaseURL)
+	err := litellm.RegisterProviderWithDescriptor(litellm.ProviderDescriptor{
+		Name:       compatName,
+		DefaultURL: defaultBaseURL,
+		Factory: func(cfg litellm.ProviderConfig) litellm.Provider {
+			return providers.NewOpenAICompat(cfg, providers.Compat{
+				ProviderName:              compatName,
+				DefaultBaseURL:            defaultBaseURL,
+				ModelFromResponse:         true,
+				HasCompletionTokenDetails: true,
+			})
+		},
+	})
+	if err != nil && !llm.IsProviderRegistered(name) {
+		return err
+	}
+	return nil
+}
+
+// applyModelQuirks 对少数 provider/model 组合应用兼容性修正。
+// Kimi 2.6 当前要求 temperature=1；agentcore 默认 0.7，走 Moonshot/OpenAI 兼容
+// 接口会被服务端直接拒绝。这里在模型实例层覆写默认采样值，避免要求用户改源码。
+func applyModelQuirks(providerKey, providerType, model string, pc ProviderConfig, chatModel agentcore.ChatModel) {
+	cfgModel, ok := chatModel.(interface{ GetConfig() *llm.GenerationConfig })
+	if !ok {
+		return
+	}
+	cfg := cfgModel.GetConfig()
+	if cfg == nil {
+		return
+	}
+
+	lowerModel := strings.ToLower(strings.TrimSpace(model))
+	lowerProvider := strings.ToLower(strings.TrimSpace(providerKey))
+	lowerType := strings.ToLower(strings.TrimSpace(providerType))
+	lowerBaseURL := strings.ToLower(strings.TrimSpace(pc.BaseURL))
+
+	if strings.HasPrefix(lowerModel, "kimi-") &&
+		(lowerProvider == "moonshot" ||
+			strings.Contains(lowerBaseURL, "moonshot.cn") ||
+			(strings.Contains(lowerBaseURL, "moonshot") && lowerType == "openai")) {
+		cfg.Temperature = 1
+		cfg.TopP = 0.95
+	}
+
+	// 豆包 Ark 的部分推理接入点（实测含 Doubao-Seed-Character）会拒绝默认
+	// 65536 max_tokens，要求 <= 32768。项目配置里通常填的是 ep-* 接入点 ID，
+	// 注册表无法提前得知真实上限，因此在 Ark 自定义接入点上保守下压默认值，
+	// 避免首次流式请求直接 400。
+	if lowerProvider == "doubao" &&
+		strings.Contains(lowerBaseURL, "ark.cn-beijing.volces.com/api/v3") &&
+		strings.HasPrefix(lowerModel, "ep-") &&
+		cfg.MaxTokens > 32768 {
+		cfg.MaxTokens = 32768
+	}
 }
 
 type failoverModel struct {
