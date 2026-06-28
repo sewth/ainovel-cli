@@ -234,6 +234,30 @@ docker run --rm \
   --headless --prompt "写一本东方玄幻长篇，主角从边陲小城起步"
 ```
 
+## 实用脚本
+
+### 合并章节为单文件
+
+把某个目录下的多个 Markdown 文件按文件名顺序合并成一个总文件，方便导出阅读：
+
+```bash
+python3 scripts/merge_markdown_folder.py <章节目录>
+```
+
+例如：
+
+```bash
+python3 scripts/merge_markdown_folder.py "/path/to/output/novel/chapters"
+```
+
+默认会在该目录下生成 `文件夹名-汇总.md`。
+
+也可以手动指定输出文件：
+
+```bash
+python3 scripts/merge_markdown_folder.py <章节目录> <输出文件>
+```
+
 也可以用 Compose：
 
 ```bash
