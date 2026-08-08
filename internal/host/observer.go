@@ -1,8 +1,6 @@
 package host
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,7 +12,6 @@ import (
 	"github.com/voocel/agentcore"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
-	"github.com/voocel/ainovel-cli/internal/utils"
 )
 
 // errorKind classifies a runtime error into a stable, short label for log
@@ -24,11 +21,19 @@ import (
 // the rendered string fallback used when the chain has been flattened
 // (e.g. inside sub-agent JSON results).
 func errorKind(err error, msg string) string {
-	if err != nil && errors.Is(err, agentcore.ErrProviderStreamIdle) {
-		return "stream_idle"
+	if kind := agentcore.ErrorKind(err); kind != "" && kind != "unknown" {
+		return kind
 	}
-	if msg != "" && agentcore.IsStreamIdleMessage(msg) {
-		return "stream_idle"
+	if msg == "" {
+		return ""
+	}
+	if kind := agentcore.ErrorKind(errors.New(msg)); kind != "unknown" {
+		return kind
+	}
+	// providerError 会把 litellm 的结构化类型附在文本末尾。
+	// HTTP/2 INTERNAL_ERROR 本身没有可分类关键词，保留这个显式 network 标记即可。
+	if strings.Contains(strings.ToLower(msg), "[network,") {
+		return "network"
 	}
 	return ""
 }
@@ -49,10 +54,9 @@ type activeCall struct {
 	depth   int
 }
 
-// observer 订阅 coordinator 事件流并投影到 Host 的输出通道。
+// observer 把 Engine 派发与 Worker 进度投影到 Host 的输出通道。
 // 它是纯观察者,不参与任何控制决策。
 type observer struct {
-	unsub   func()
 	emitEv  func(Event)
 	emitD   func(string)
 	emitC   func()
@@ -65,14 +69,16 @@ type observer struct {
 	// "用户手动暂停"事件重复）。真实异常（非 cancel）仍照常上报。
 	aborting atomic.Bool
 
-	streamThinking        bool
-	lastThinkingByAgent   map[string]string          // agent → 最近的累积 thinking 文本（用于提取增量 delta）
-	dispatchStarts        map[string]*activeCall     // dispatched agent → 进行中的 DISPATCH 调用
-	currentDispatchTarget string                     // 当前正在执行的 subagent 名（handleToolEnd 时 Args 可能为空）
-	toolStarts            map[string]*activeCall     // agent → 进行中的 TOOL 调用
-	streamExtractors      map[string]*agentExtractor // agent → 当前工具调用 JSON 参数的内容抽取器
-	streamHasContent      bool                       // 当前 streamRound 是否已输出过内容（判断是否需要段落分隔）
-	streamLastByte        byte                       // 最近一次流式输出的末字节（用于精确补齐换行）
+	streamThinking      bool
+	lastThinkingByAgent map[string]string          // agent → 最近的累积 thinking 文本（用于提取增量 delta）
+	dispatchStarts      map[string]*activeCall     // dispatched agent → 进行中的 DISPATCH 调用
+	toolStarts          map[string]*activeCall     // agent → 进行中的 TOOL 调用
+	streamExtractors    map[string]*agentExtractor // agent → 当前工具调用 JSON 参数的内容抽取器
+	streamArgPrefixes   map[string]string          // agent/tool → 参数流前缀，用于提前识别轻量标签
+	streamArgLabels     map[string]string          // agent/tool → 已从参数流提前识别出的展示名
+	retryEvents         map[string]string          // retry scope → event ID，用同一行原地更新 (2/7)
+	streamHasContent    bool                       // 当前 streamRound 是否已输出过内容（判断是否需要段落分隔）
+	streamLastByte      byte                       // 最近一次流式输出的末字节（用于精确补齐换行）
 }
 
 // agentExtractor 记录某个 agent 当前正在抽取的工具名与抽取器实例。
@@ -93,8 +99,8 @@ type agentState struct {
 	updated time.Time
 }
 
-func newObserver(coordinator *agentcore.Agent, s *storepkg.Store, emitEv func(Event), emitD func(string), emitC func()) *observer {
-	o := &observer{
+func newObserver(s *storepkg.Store, emitEv func(Event), emitD func(string), emitC func()) *observer {
+	return &observer{
 		emitEv:              emitEv,
 		emitD:               emitD,
 		emitC:               emitC,
@@ -104,9 +110,64 @@ func newObserver(coordinator *agentcore.Agent, s *storepkg.Store, emitEv func(Ev
 		dispatchStarts:      make(map[string]*activeCall),
 		toolStarts:          make(map[string]*activeCall),
 		streamExtractors:    make(map[string]*agentExtractor),
+		streamArgPrefixes:   make(map[string]string),
+		streamArgLabels:     make(map[string]string),
+		retryEvents:         make(map[string]string),
 	}
-	o.unsub = coordinator.Subscribe(o.handle)
-	return o
+}
+
+// ── Engine 直驱入口 ──
+//
+// Engine 直接运行 Worker，事件来源分为两条:
+//  1. dispatchStart/dispatchFinish —— Engine 在派发边界直接调用(DISPATCH 行)
+//  2. workerProgress —— Worker 的进度中继(ctx ToolProgress)，
+//     由 handleToolUpdate 统一处理 TOOL/流式正文/thinking/retry/context
+//     (TOOL 行/流式正文/thinking/retry/context)。
+
+// dispatchStart 记录一次 Worker 派发开始并发 DISPATCH 行。
+func (o *observer) dispatchStart(agent, task string) {
+	summary := dispatchSummary(agent, task)
+	o.updateAgent(agent, func(a *agentState) {
+		a.state = "working"
+		a.tool = ""
+		a.summary = fmt.Sprintf("engine → %s", summary)
+	})
+	id := nextEventID()
+	o.dispatchStarts[agent] = &activeCall{id: id, start: time.Now(), summary: summary}
+	o.emitAndLog(Event{
+		ID:       id,
+		Time:     time.Now(),
+		Category: "DISPATCH",
+		Agent:    "engine",
+		Summary:  summary,
+		Level:    "info",
+	})
+}
+
+// dispatchFinish 把 DISPATCH 行落成完成态并复位 Worker 状态;
+// 清理该 Worker 名下的孤儿 TOOL 行(abort/错误路径 ProgressToolEnd 可能缺席)。
+func (o *observer) dispatchFinish(agent string, runErr error) {
+	o.updateAgent(agent, func(a *agentState) {
+		a.state = "idle"
+		a.tool = ""
+	})
+	delete(o.lastThinkingByAgent, agent)
+	if call, ok := o.toolStarts[agent]; ok {
+		delete(o.toolStarts, agent)
+		delete(o.streamExtractors, agent)
+		o.emitCallFinish(call, "TOOL", agent, runErr)
+	}
+	if call, ok := o.dispatchStarts[agent]; ok {
+		delete(o.dispatchStarts, agent)
+		o.emitCallFinish(call, "DISPATCH", agent, runErr)
+	}
+	o.streamClear()
+}
+
+// workerProgress 把 Worker 进度中继适配为既有的 ToolExecUpdate 处理。
+func (o *observer) workerProgress(p agentcore.ProgressPayload) {
+	payload := p
+	o.handleToolUpdate(agentcore.Event{Type: agentcore.EventToolExecUpdate, Progress: &payload})
 }
 
 func (o *observer) finalize() {
@@ -122,17 +183,17 @@ func (o *observer) finalize() {
 // "context canceled" 类衍生事件是否需要抑制（避免与"用户手动暂停"重复）。
 func (o *observer) setAborting(v bool) { o.aborting.Store(v) }
 
-// isCancellationNoise 判断一个错误是否为 abort 引发的衍生噪声。
-// 仅当 Host 处于 aborting 态时返回 true 才有意义——非 abort 期间的
-// context.Canceled 可能反映真实问题（如外部 ctx 被取消），仍应上报。
-func (o *observer) isCancellationNoise(err error, msg string) bool {
-	if !o.aborting.Load() {
-		return false
+func (o *observer) retryEventID(scope string, attempt int) string {
+	if strings.TrimSpace(scope) == "" {
+		scope = "engine"
 	}
-	if err != nil && errors.Is(err, context.Canceled) {
-		return true
+	if o.retryEvents == nil {
+		o.retryEvents = make(map[string]string)
 	}
-	return strings.Contains(strings.ToLower(msg), "context canceled")
+	if attempt <= 1 || o.retryEvents[scope] == "" {
+		o.retryEvents[scope] = nextEventID()
+	}
+	return o.retryEvents[scope]
 }
 
 // emitAndLog 用于调用类事件的"开始"态：发给 TUI 但不写入 runtime queue，
@@ -147,705 +208,22 @@ func (o *observer) persistEvent(ev Event) {
 		return
 	}
 	priority := domain.RuntimePriorityBackground
-	switch ev.Category {
-	case "SYSTEM", "ERROR":
+	switch {
+	case ev.Level == "error":
+		priority = domain.RuntimePriorityControl
+	case ev.Category == "SYSTEM" || ev.Category == "ERROR":
 		priority = domain.RuntimePriorityControl
 	}
-	_, _ = o.store.Runtime.AppendQueue(domain.RuntimeQueueItem{
+	if _, err := o.store.Runtime.AppendQueue(domain.RuntimeQueueItem{
 		Time:     ev.Time,
 		Kind:     domain.RuntimeQueueUIEvent,
 		Priority: priority,
 		Category: ev.Category,
 		Summary:  ev.Summary,
 		Payload:  ev,
-	})
-}
-
-func (o *observer) handle(ev agentcore.Event) {
-	switch ev.Type {
-	case agentcore.EventToolExecStart:
-		o.handleToolStart(ev)
-	case agentcore.EventToolExecUpdate:
-		o.handleToolUpdate(ev)
-	case agentcore.EventToolExecEnd:
-		o.handleToolEnd(ev)
-	case agentcore.EventMessageUpdate:
-		o.handleMessageUpdate(ev)
-	case agentcore.EventMessageEnd:
-		o.streamClear()
-	case agentcore.EventTurnStart:
-		if ev.Progress != nil && ev.Progress.Kind == agentcore.ProgressTurnCounter {
-			o.updateAgent(ev.Progress.Agent, func(a *agentState) {
-				a.turn = ev.Progress.Turn
-			})
-		}
-	case agentcore.EventRetry:
-		if ev.RetryInfo != nil {
-			msg := ""
-			if ev.RetryInfo.Err != nil {
-				msg = ev.RetryInfo.Err.Error()
-			}
-			prefix := fmt.Sprintf("重试 (%d/%d): ", ev.RetryInfo.Attempt, ev.RetryInfo.MaxRetries)
-			retryEv := Event{
-				Time:     time.Now(),
-				Category: "SYSTEM",
-				Summary:  prefix + truncate(msg, 80),
-				Detail:   prefix + msg,
-				Kind:     errorKind(ev.RetryInfo.Err, msg),
-				Level:    "warn",
-			}
-			o.emitEv(retryEv)
-			o.persistEvent(retryEv)
-		}
-	case agentcore.EventError:
-		if ev.Err != nil {
-			fullMsg := ev.Err.Error()
-			if o.isCancellationNoise(ev.Err, fullMsg) {
-				// 用户主动 abort 衍生的 ctx-cancel 错误；已有"用户手动暂停"事件，不再重复刷屏。
-				slog.Debug("suppressed cancel-derived error", "module", "agent", "msg", fullMsg)
-				return
-			}
-			errEv := Event{
-				Time:     time.Now(),
-				Category: "ERROR",
-				Summary:  truncate(fullMsg, 120),
-				Detail:   fullMsg,
-				Kind:     errorKind(ev.Err, fullMsg),
-				Level:    "error",
-			}
-			o.emitEv(errEv)
-			o.persistEvent(errEv)
-		}
+	}); err != nil {
+		slog.Warn("运行事件持久化失败", "module", "observer", "category", ev.Category, "err", err)
 	}
-}
-
-func (o *observer) handleMessageUpdate(ev agentcore.Event) {
-	if ev.Delta == "" {
-		return
-	}
-	// Coordinator 的 tool-call 参数是给 subagent 的任务 JSON，没有可读内容，直接丢弃。
-	if ev.DeltaKind == agentcore.DeltaToolCall {
-		return
-	}
-	o.emitStreamDelta(ev.Delta, ev.DeltaKind == agentcore.DeltaThinking)
-}
-
-func (o *observer) handleToolStart(ev agentcore.Event) {
-	if ev.Tool == "" {
-		return
-	}
-	agent := agentFromEvent(ev)
-
-	// subagent 调用 → DISPATCH 事件（进行中）
-	if ev.Tool == "subagent" {
-		sub := parseSubagentArgs(ev.Args)
-		target := sub.agent
-		if target == "" {
-			target = "subagent"
-		}
-		dispatchSummary := target
-		if sub.task != "" {
-			firstLine := strings.TrimSpace(strings.SplitN(sub.task, "\n", 2)[0])
-			if firstLine != "" {
-				dispatchSummary += "（" + truncate(firstLine, 30) + "）"
-			}
-		}
-		o.updateAgent(agent, func(a *agentState) {
-			a.state = "working"
-			a.tool = ev.Tool
-			a.summary = fmt.Sprintf("%s → %s", agent, dispatchSummary)
-		})
-		o.currentDispatchTarget = target
-		id := nextEventID()
-		o.dispatchStarts[target] = &activeCall{id: id, start: time.Now(), summary: dispatchSummary}
-		o.emitAndLog(Event{
-			ID:       id,
-			Time:     time.Now(),
-			Category: "DISPATCH",
-			Agent:    agent,
-			Summary:  dispatchSummary,
-			Level:    "info",
-		})
-		return
-	}
-
-	// coordinator 自身工具（进行中）
-	toolName := displayToolName(ev.Tool, ev.Args)
-	o.updateAgent(agent, func(a *agentState) {
-		a.state = "working"
-		a.tool = ev.Tool
-		a.summary = fmt.Sprintf("%s → %s", agent, toolName)
-	})
-	id := nextEventID()
-	o.toolStarts[agent] = &activeCall{id: id, start: time.Now(), summary: toolName}
-	o.emitAndLog(Event{
-		ID:       id,
-		Time:     time.Now(),
-		Category: "TOOL",
-		Agent:    agent,
-		Summary:  toolName,
-		Level:    "info",
-	})
-	o.emitFallbackStreamHeader(ev.Tool)
-}
-
-func (o *observer) handleToolUpdate(ev agentcore.Event) {
-	if ev.Progress == nil {
-		return
-	}
-	switch ev.Progress.Kind {
-	case agentcore.ProgressToolDelta:
-		if ev.Progress.Delta != "" {
-			o.handleSubagentDelta(ev.Progress)
-		}
-	case agentcore.ProgressToolStart:
-		// 子代理内部的工具调用（如 writer → draft_chapter）。
-		// 注意：TOOL 行可能已经在流式识别阶段被 handleSubagentDelta 提前发出。
-		// 此处：若已发 → 只更新 summary（args 此时完整，能显示 "tool(第N章)"）；否则正常发。
-		if ev.Progress.Agent == "" || ev.Progress.Tool == "" {
-			break
-		}
-		toolName := displayToolName(ev.Progress.Tool, ev.Progress.Args)
-		if call, ok := o.toolStarts[ev.Progress.Agent]; ok {
-			if toolName != "" && toolName != call.summary {
-				call.summary = toolName
-				// 发 summary-only 更新事件（同 ID），TUI applyEvent 会合并
-				o.emitEv(Event{
-					ID:       call.id,
-					Time:     call.start,
-					Category: "TOOL",
-					Agent:    ev.Progress.Agent,
-					Summary:  toolName,
-					Level:    "info",
-					Depth:    call.depth,
-				})
-			}
-			o.updateAgent(ev.Progress.Agent, func(a *agentState) {
-				a.state = "working"
-				a.tool = ev.Progress.Tool
-				a.summary = fmt.Sprintf("%s → %s", ev.Progress.Agent, toolName)
-			})
-			break
-		}
-		// 未提前发过 → 正常流程
-		// （非流式 tool args 的模型不会触发 ensureSubagentToolStarted，
-		// fallback header 必须在这条路径上补一次，否则 read_chapter 这类
-		// 无 extractor 的工具流式面板上就没有 ✻ 头部，紧贴前面思考一段。）
-		id := nextEventID()
-		o.toolStarts[ev.Progress.Agent] = &activeCall{id: id, start: time.Now(), summary: toolName, depth: 1}
-		o.emitAndLog(Event{
-			ID:       id,
-			Time:     time.Now(),
-			Category: "TOOL",
-			Agent:    ev.Progress.Agent,
-			Summary:  toolName,
-			Level:    "info",
-			Depth:    1,
-		})
-		o.updateAgent(ev.Progress.Agent, func(a *agentState) {
-			a.state = "working"
-			a.tool = ev.Progress.Tool
-			a.summary = fmt.Sprintf("%s → %s", ev.Progress.Agent, toolName)
-		})
-		o.emitFallbackStreamHeader(ev.Progress.Tool)
-	case agentcore.ProgressToolEnd:
-		delete(o.streamExtractors, ev.Progress.Agent)
-		if ev.Progress.Agent == "" {
-			return
-		}
-		call, ok := o.toolStarts[ev.Progress.Agent]
-		if !ok {
-			return
-		}
-		delete(o.toolStarts, ev.Progress.Agent)
-		// 同 ID 更新事件：TUI 按 ID 定位原 TOOL 行，回填 FinishedAt / Duration。
-		// Summary / Depth 也带上，保证 runtime queue replay 时能还原完整行。
-		finishEv := Event{
-			ID:         call.id,
-			Time:       call.start,
-			FinishedAt: time.Now(),
-			Category:   "TOOL",
-			Agent:      ev.Progress.Agent,
-			Summary:    call.summary,
-			Level:      "info",
-			Depth:      call.depth,
-			Duration:   time.Since(call.start),
-		}
-		o.emitEv(finishEv)
-		o.persistEvent(finishEv)
-	case agentcore.ProgressThinking:
-		o.handleThinkingProgress(ev)
-	case agentcore.ProgressRetry:
-		prefix := fmt.Sprintf("重试 (%d/%d): ", ev.Progress.Attempt, ev.Progress.MaxRetries)
-		retryEv := Event{
-			Time:     time.Now(),
-			Category: "SYSTEM",
-			Agent:    ev.Progress.Agent,
-			Summary:  prefix + truncate(ev.Progress.Message, 80),
-			Detail:   prefix + ev.Progress.Message,
-			Kind:     errorKind(nil, ev.Progress.Message),
-			Level:    "warn",
-			Depth:    1,
-		}
-		o.emitEv(retryEv)
-		o.persistEvent(retryEv)
-	case agentcore.ProgressToolError:
-		delete(o.streamExtractors, ev.Progress.Agent)
-		msg := ev.Progress.Message
-		if msg == "" {
-			msg = "unknown error"
-		}
-		// 如果有进行中的 TOOL 行，原地标记为失败；否则独立追加 ERROR 行。
-		if call, ok := o.toolStarts[ev.Progress.Agent]; ok {
-			delete(o.toolStarts, ev.Progress.Agent)
-			finishEv := Event{
-				ID:         call.id,
-				Time:       call.start,
-				FinishedAt: time.Now(),
-				Failed:     true,
-				Category:   "TOOL",
-				Agent:      ev.Progress.Agent,
-				Summary:    call.summary,
-				Level:      "error",
-				Depth:      call.depth,
-				Duration:   time.Since(call.start),
-			}
-			o.emitEv(finishEv)
-			o.persistEvent(finishEv)
-		}
-		// 附加 ERROR 详情行（补充错误信息，便于排查）
-		errEv := Event{
-			Time:     time.Now(),
-			Category: "ERROR",
-			Agent:    ev.Progress.Agent,
-			Summary:  fmt.Sprintf("%s 错误: %s", ev.Progress.Tool, truncate(msg, 100)),
-			Detail:   fmt.Sprintf("%s 错误: %s", ev.Progress.Tool, msg),
-			Kind:     errorKind(nil, msg),
-			Level:    "error",
-			Depth:    1,
-		}
-		o.emitEv(errEv)
-		o.persistEvent(errEv)
-	case agentcore.ProgressContext:
-		o.handleContextProgress(ev)
-	}
-}
-
-// handleSubagentDelta 分流 subagent 的文本与工具调用参数：
-// - DeltaText 直接作为 markdown 流出
-// - DeltaToolCall 只对已知的长内容工具（如 draft_chapter.content）抽取字段流出；其他工具的参数 JSON 全部丢弃
-func (o *observer) handleSubagentDelta(p *agentcore.ProgressPayload) {
-	if p.DeltaKind != agentcore.DeltaToolCall {
-		o.emitStreamDelta(p.Delta, false)
-		return
-	}
-	if p.Tool == "" {
-		return // 工具名未就绪，下一个 delta 再试
-	}
-
-	// 流式识别到工具名时提前发 TOOL 进行中事件，让 spinner 覆盖整段 LLM 生成期间
-	// （否则 draft_chapter 这类工具的"进行中"只在真实 Execute 的几十毫秒里显示）。
-	// 真正的 ProgressToolStart 到来时识别到 toolStarts 已有记录，只会补齐 summary。
-	o.ensureSubagentToolStarted(p.Agent, p.Tool)
-
-	cur, ok := o.streamExtractors[p.Agent]
-	// 同工具调用 args 已闭合（顶层 } 命中）后，仍可能收到 trailing delta：
-	// 某些 provider（deepseek-v4-flash 实测）会把单次 args 拆成多个 chunk，
-	// 最末一个 chunk 在 `}` 之后还跟着空白或重复字符。此时若按"工具名匹配 +
-	// Done 即重建"处理，新 extractor 又会 emit 一次 ✻ header 并把尾段 token
-	// 当作新 args 解析。这些 delta 是冗余尾巴，丢弃即可。
-	if ok && cur.tool == p.Tool && cur.ext.Done() {
-		return
-	}
-	// 工具名变了或还没建过：新建。
-	if !ok || cur.tool != p.Tool {
-		ext := newToolExtractor(p.Tool)
-		if ext == nil {
-			delete(o.streamExtractors, p.Agent)
-			return
-		}
-		cur = &agentExtractor{tool: p.Tool, ext: ext}
-		o.streamExtractors[p.Agent] = cur
-	}
-	if emitted := cur.ext.Feed(p.Delta); emitted != "" {
-		if !cur.emittedAny {
-			cur.emittedAny = true
-			// streamClear 让 extractor 的 ✻ header 落在新 round 起点，配合
-			// renderStreamContent 的 HasPrefix("✻") 检查走 renderAgentBlock 高亮
-			// 路径；用 ensureStreamParagraphBreak 只插空行不开 round，✻ 仍会被
-			// 前面的 thinking/正文包住，落到 renderChapterBlock 用默认色画掉。
-			o.streamClear()
-			// streamClear 防御性清空了 streamExtractors。当前 cur 还要继续 Feed
-			// 本工具调用后续的 delta，必须立刻把它重新登记回去；否则下一段 delta
-			// 来时会新建 extractor，从 args 中段开始解析（在嵌套对象的 `{` 处
-			// 才进入 psBeforeKey），把 timeline_events.time / foreshadow_updates.id
-			// 等当成顶层字段，TUI 上重复出现 ✻ header。
-			o.streamExtractors[p.Agent] = cur
-		}
-		o.emitStreamDelta(emitted, false)
-	}
-}
-
-func (o *observer) handleThinkingProgress(ev agentcore.Event) {
-	agent := ev.Progress.Agent
-	thinking := ev.Progress.Thinking
-	if agent == "" || thinking == "" {
-		return
-	}
-
-	prev := o.lastThinkingByAgent[agent]
-	delta := thinking
-	if strings.HasPrefix(thinking, prev) {
-		delta = thinking[len(prev):]
-	}
-	o.lastThinkingByAgent[agent] = thinking
-	if delta == "" {
-		return
-	}
-	o.emitStreamDelta(delta, true)
-}
-
-func (o *observer) handleContextProgress(ev agentcore.Event) {
-	if ev.Progress == nil || len(ev.Progress.Meta) == 0 {
-		return
-	}
-	var payload struct {
-		Tokens        int     `json:"tokens"`
-		ContextWindow int     `json:"context_window"`
-		Percent       float64 `json:"percent"`
-		Scope         string  `json:"scope"`
-		Strategy      string  `json:"strategy"`
-	}
-	if json.Unmarshal(ev.Progress.Meta, &payload) != nil {
-		return
-	}
-
-	agent := ev.Progress.Agent
-	if agent == "" {
-		agent = "coordinator"
-	}
-
-	// 更新 agent 快照（TUI 侧边栏始终可见）
-	o.updateAgent(agent, func(a *agentState) {
-		a.context = AgentContextSnapshot{
-			Tokens:        payload.Tokens,
-			ContextWindow: payload.ContextWindow,
-			Percent:       payload.Percent,
-			Scope:         payload.Scope,
-			Strategy:      payload.Strategy,
-		}
-	})
-
-	level := "info"
-	if payload.Percent > 85 {
-		level = "warn"
-	}
-	summary := fmt.Sprintf("%s 上下文 %.0f%% (%d/%d) 策略: %s", agent, payload.Percent, payload.Tokens, payload.ContextWindow, payload.Strategy)
-
-	depth := 0
-	if agent != "coordinator" {
-		depth = 1
-	}
-
-	if payload.Strategy != "" {
-		// 触发了压缩 → 事件流 + 日志
-		ctxEv := Event{Time: time.Now(), Category: "SYSTEM", Agent: agent, Summary: summary, Level: level, Depth: depth}
-		o.emitEv(ctxEv)
-		o.persistEvent(ctxEv)
-	} else {
-		// 普通使用率报告 → 仅日志
-		slogLevel := slog.LevelInfo
-		if level == "warn" {
-			slogLevel = slog.LevelWarn
-		}
-		slog.Log(context.Background(), slogLevel, summary, "module", "context", "agent", agent)
-	}
-}
-
-func (o *observer) handleToolEnd(ev agentcore.Event) {
-	agent := agentFromEvent(ev)
-	// 工具结束：把状态切回 idle，否则侧边栏会永远停在 working。
-	// 子代理派遣结束时 dispatchTarget 的状态会在下方另行清除。
-	o.updateAgent(agent, func(a *agentState) {
-		a.tool = ""
-		a.state = "idle"
-	})
-	delete(o.lastThinkingByAgent, agent)
-
-	// 取出进行中的 DISPATCH 记录（handleToolEnd 的 ev.Args 可能为空，从 currentDispatchTarget 取）
-	var dispatchCall *activeCall
-	var dispatchTarget string
-	if ev.Tool == "subagent" {
-		dispatchTarget = o.currentDispatchTarget
-		o.currentDispatchTarget = ""
-		if dispatchTarget == "" {
-			if sub := parseSubagentArgs(ev.Args); sub.agent != "" {
-				dispatchTarget = sub.agent
-			}
-		}
-		if dispatchTarget == "" {
-			dispatchTarget = "subagent"
-		}
-		if call, ok := o.dispatchStarts[dispatchTarget]; ok {
-			dispatchCall = call
-			delete(o.dispatchStarts, dispatchTarget)
-		}
-		// 派遣结束：把子代理状态复位为 idle（成功/失败/错误路径都需要此清理）
-		if dispatchTarget != "subagent" {
-			o.updateAgent(dispatchTarget, func(a *agentState) {
-				a.state = "idle"
-				a.tool = ""
-			})
-		}
-	}
-
-	// 取出 coordinator 直接工具（非 subagent）的进行中记录（罕见，但保证一致性）
-	var toolCall *activeCall
-	if ev.Tool != "subagent" {
-		if call, ok := o.toolStarts[agent]; ok {
-			toolCall = call
-			delete(o.toolStarts, agent)
-		}
-	}
-
-	// 统一的调用完成态（成功/失败），通过同 ID 更新原行
-	emitFinish := func(call *activeCall, category, agentName string, failed bool) {
-		if call == nil {
-			return
-		}
-		level := "success"
-		if failed {
-			level = "error"
-		}
-		finishEv := Event{
-			ID:         call.id,
-			Time:       call.start,
-			FinishedAt: time.Now(),
-			Failed:     failed,
-			Category:   category,
-			Agent:      agentName,
-			Summary:    call.summary,
-			Level:      level,
-			Depth:      call.depth,
-			Duration:   time.Since(call.start),
-		}
-		o.emitEv(finishEv)
-		o.persistEvent(finishEv)
-	}
-	emitDispatchFinish := func(failed bool) {
-		emitFinish(dispatchCall, "DISPATCH", dispatchTarget, failed)
-	}
-	emitToolFinish := func(failed bool) {
-		emitFinish(toolCall, "TOOL", agent, failed)
-	}
-	// 兜底：若 subagent 结束时，该 subagent 内部还有未完成的 TOOL 调用（比如 ensureSubagentToolStarted
-	// 提前发了进行中事件，但随后 abort/context cancel 让 ProgressToolEnd 没来），
-	// 在这里强制发 finish，避免 TOOL 行永远"进行中"。状态跟随 dispatch 同步。
-	flushOrphanSubagentTool := func(failed bool) {
-		if dispatchTarget == "" {
-			return
-		}
-		call, ok := o.toolStarts[dispatchTarget]
-		if !ok {
-			return
-		}
-		delete(o.toolStarts, dispatchTarget)
-		delete(o.streamExtractors, dispatchTarget)
-		emitFinish(call, "TOOL", dispatchTarget, failed)
-	}
-
-	if ev.IsError {
-		depth := 0
-		if agent != "coordinator" {
-			depth = 1
-		}
-		errText := ""
-		if len(ev.Result) > 0 {
-			errText = string(ev.Result)
-		}
-		// 用户主动 abort 衍生的 ctx-cancel：状态清理仍要走（dispatch / tool 行必须落回完成态），
-		// 但跳过独立 ERROR 行 + 错误日志，与 EventError 路径保持一致。
-		if o.isCancellationNoise(nil, errText) {
-			slog.Debug("suppressed cancel-derived tool error", "module", "agent", "tool", ev.Tool, "msg", errText)
-			flushOrphanSubagentTool(true)
-			emitDispatchFinish(true)
-			emitToolFinish(true)
-			return
-		}
-		summary := fmt.Sprintf("%s 失败", ev.Tool)
-		detail := summary
-		kind := ""
-		if errText != "" {
-			kind = errorKind(nil, errText)
-			detail = fmt.Sprintf("%s → %s: %s", agent, ev.Tool, errText)
-			summary += ": " + truncate(errText, 120)
-		}
-		flushOrphanSubagentTool(true)
-		emitDispatchFinish(true)
-		emitToolFinish(true)
-		errEv := Event{
-			Time:     time.Now(),
-			Category: "ERROR",
-			Agent:    agent,
-			Summary:  summary,
-			Detail:   detail,
-			Kind:     kind,
-			Level:    "error",
-			Depth:    depth,
-		}
-		o.emitEv(errEv)
-		o.persistEvent(errEv)
-		return
-	}
-
-	if errEv, fullErr := o.subagentResultErrorEvent(ev); errEv != nil {
-		if o.isCancellationNoise(nil, fullErr) {
-			slog.Debug("suppressed cancel-derived subagent error", "module", "agent", "tool", ev.Tool, "msg", fullErr)
-			flushOrphanSubagentTool(true)
-			emitDispatchFinish(true)
-			return
-		}
-		if dispatchTarget != "" && dispatchTarget != "subagent" {
-			errEv.Agent = dispatchTarget
-		}
-		flushOrphanSubagentTool(true)
-		emitDispatchFinish(true)
-		o.emitEv(*errEv)
-		o.persistEvent(*errEv)
-		return
-	}
-
-	// subagent 成功完成 → 更新原 DISPATCH 行为完成态（带耗时）
-	if ev.Tool == "subagent" {
-		flushOrphanSubagentTool(false)
-		emitDispatchFinish(false)
-		return
-	}
-
-	// coordinator 直接工具成功完成
-	emitToolFinish(false)
-}
-
-func (o *observer) emitStreamDelta(delta string, thinking bool) {
-	if delta == "" {
-		return
-	}
-	if thinking != o.streamThinking {
-		o.emitD(utils.ThinkingSep)
-		o.streamThinking = thinking
-	}
-	o.emitD(delta)
-	o.streamHasContent = true
-	o.streamLastByte = delta[len(delta)-1]
-}
-
-// ensureSubagentToolStarted 在流式识别到 tool_call 首次出现时，提前为该 agent
-// 登记一次进行中的 TOOL 调用，使事件流的 spinner 覆盖"LLM 流式生成 tool_call
-// 参数"这一段时间（通常占调用总耗时的 99%）。args 此时尚不完整，暂以纯工具名
-// 为 summary；等真正的 ProgressToolStart 到来时会补齐带参数的 summary。
-func (o *observer) ensureSubagentToolStarted(agent, tool string) {
-	if agent == "" || tool == "" {
-		return
-	}
-	if _, ok := o.toolStarts[agent]; ok {
-		return // 已有进行中调用，幂等
-	}
-	id := nextEventID()
-	o.toolStarts[agent] = &activeCall{
-		id:      id,
-		start:   time.Now(),
-		summary: tool, // 先用纯工具名，ProgressToolStart 到来时可能更新为 tool(第N章)
-		depth:   1,
-	}
-	o.emitAndLog(Event{
-		ID:       id,
-		Time:     time.Now(),
-		Category: "TOOL",
-		Agent:    agent,
-		Summary:  tool,
-		Level:    "info",
-		Depth:    1,
-	})
-	o.updateAgent(agent, func(a *agentState) {
-		a.state = "working"
-		a.tool = tool
-	})
-	o.emitFallbackStreamHeader(tool)
-}
-
-// emitFallbackStreamHeader 给未配置 extractor 的工具补一行 ✻ 标题到流面板。
-// 三条路径都要调用以保证一致：
-//  1. ensureSubagentToolStarted —— subagent 流式 tool args（DeltaToolCall）
-//  2. handleToolUpdate ProgressToolStart —— subagent 非流式 tool args
-//  3. handleToolStart —— coordinator 自身工具
-//
-// 缺任何一条，同一个工具就会"writer 调有 ✻、coordinator 调没 ✻"或反过来。
-func (o *observer) emitFallbackStreamHeader(tool string) {
-	if _, has := toolDisplays[tool]; has {
-		return // 有 extractor，header 由 extractor 自行输出
-	}
-	o.streamClear()
-	o.emitStreamDelta(streamHeaderFallback(tool)+"\n", false)
-}
-
-// streamHeaderFallback 为未配置 extractor 的工具生成流式 header 文本，
-// 让用户即使对轻量读取类工具也能看到"在调用什么"。
-//
-// 前缀 "✻ " 是约定的"agent 调度块"标记 — TUI 的 renderStreamContent 见到这个
-// 前缀会走 renderAgentBlock 路径渲染（图标 + 高亮 label + 分隔线），
-// 否则会落到正文块路径用终端默认色，header 看起来就是普通正文不醒目。
-func streamHeaderFallback(tool string) string {
-	label := tool
-	switch tool {
-	case "ask_user":
-		label = "向用户提问"
-	}
-	return "✻ " + label
-}
-
-// streamClear 通知 TUI 开启新一轮 streamRound，同时重置与段落分隔相关的状态。
-// 逻辑上新 round 是"空 stream"，否则下一次首个 extractor emit 会误补前导空行。
-//
-// streamThinking 必须一并重置：emitStreamDelta 用 streamThinking 跨调用追踪
-// 上一段是不是思考。新 round 内还没输出过任何内容，下一次 emit(thinking=false)
-// 不应该再插入 ThinkingSep。否则 fallback header（如 ✻ 读章节）会被 \x02
-// 抢先占头，renderStreamContent 的 HasPrefix("✻") 失配，整段落到正文路径
-// 再被 ThinkingSep 切分为思考段，title 颜色被画成思考色。
-func (o *observer) streamClear() {
-	o.emitC()
-	o.streamHasContent = false
-	o.streamLastByte = 0
-	o.streamThinking = false
-	// 上一轮的 subagent 结束前 ProgressToolEnd 已 delete，这里防御性清空。
-	if len(o.streamExtractors) > 0 {
-		o.streamExtractors = make(map[string]*agentExtractor)
-	}
-}
-
-func (o *observer) subagentResultErrorEvent(ev agentcore.Event) (*Event, string) {
-	if ev.Tool != "subagent" || len(ev.Result) == 0 {
-		return nil, ""
-	}
-	sub := parseSubagentArgs(ev.Args)
-	errMsg := parseSubagentResultError(ev.Result)
-	if errMsg == "" {
-		return nil, ""
-	}
-
-	target := "subagent"
-	if sub.agent != "" {
-		target = sub.agent
-	}
-	fullErr := fmt.Sprintf("%s 失败: %s", target, errMsg)
-	return &Event{
-		Time:     time.Now(),
-		Category: "ERROR",
-		Agent:    "coordinator",
-		Summary:  fmt.Sprintf("%s 失败: %s", target, truncate(errMsg, 120)),
-		Detail:   fullErr,
-		Kind:     errorKind(nil, errMsg),
-		Level:    "error",
-	}, fullErr
 }
 
 func (o *observer) updateAgent(name string, fn func(*agentState)) {
@@ -879,137 +257,4 @@ func (o *observer) agentSnapshots() []AgentSnapshot {
 		})
 	}
 	return snaps
-}
-
-func agentFromEvent(ev agentcore.Event) string {
-	if ev.Progress != nil && ev.Progress.Agent != "" {
-		return ev.Progress.Agent
-	}
-	return "coordinator"
-}
-
-func displayToolName(tool string, args json.RawMessage) string {
-	if len(args) == 0 {
-		return tool
-	}
-	switch tool {
-	case "save_foundation":
-		var p struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(args, &p) == nil && p.Type != "" {
-			return fmt.Sprintf("%s[%s]", tool, p.Type)
-		}
-	case "commit_chapter", "plan_chapter", "draft_chapter", "check_consistency":
-		var p struct {
-			Chapter int `json:"chapter"`
-		}
-		if json.Unmarshal(args, &p) == nil && p.Chapter > 0 {
-			return fmt.Sprintf("%s(第%d章)", tool, p.Chapter)
-		}
-	case "save_review":
-		var p struct {
-			Chapter int    `json:"chapter"`
-			Scope   string `json:"scope"`
-			Verdict string `json:"verdict"`
-		}
-		if json.Unmarshal(args, &p) == nil {
-			label := ""
-			switch p.Scope {
-			case "arc":
-				label = "本弧"
-			case "global":
-				label = "全局"
-			default:
-				if p.Chapter > 0 {
-					label = fmt.Sprintf("第%d章", p.Chapter)
-				}
-			}
-			if label == "" {
-				return tool
-			}
-			if p.Verdict != "" {
-				return fmt.Sprintf("%s(%s·%s)", tool, label, p.Verdict)
-			}
-			return fmt.Sprintf("%s(%s)", tool, label)
-		}
-	case "novel_context":
-		var p struct {
-			Chapter int `json:"chapter"`
-		}
-		if json.Unmarshal(args, &p) == nil && p.Chapter > 0 {
-			return fmt.Sprintf("%s(第%d章)", tool, p.Chapter)
-		}
-	case "read_chapter":
-		var p struct {
-			Chapter   int    `json:"chapter"`
-			Source    string `json:"source"`
-			Character string `json:"character"`
-		}
-		if json.Unmarshal(args, &p) == nil && p.Chapter > 0 {
-			suffix := ""
-			if p.Character != "" {
-				suffix = "·" + p.Character + "对话"
-			} else if p.Source == "draft" {
-				suffix = "·草稿"
-			}
-			return fmt.Sprintf("%s(第%d章%s)", tool, p.Chapter, suffix)
-		}
-	}
-	return tool
-}
-
-type subagentInvocation struct {
-	agent string
-	task  string
-}
-
-func parseSubagentResultError(result json.RawMessage) string {
-	if len(result) == 0 {
-		return ""
-	}
-	// 主流错误：{"error": "..."} 对象（unknown agent / invalid model / 子代理执行失败）
-	var obj struct {
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal(result, &obj); err == nil && obj.Error != "" {
-		return obj.Error
-	}
-	// 兼容 agentcore SubAgentTool 的裸字符串错误返回：
-	// "Invalid parameters: ..." / "background mode requires ..." / "Too many parallel tasks ..."
-	// 这些是 tool 层参数校验失败，is_error=false 但内容是错误说明，需识别为错误避免误判为成功。
-	var s string
-	if json.Unmarshal(result, &s) == nil && isSubagentErrorString(s) {
-		return s
-	}
-	return ""
-}
-
-var subagentErrorPrefixes = []string{
-	"Invalid parameters",
-	"background mode requires",
-	"Too many parallel tasks",
-}
-
-func isSubagentErrorString(s string) bool {
-	for _, p := range subagentErrorPrefixes {
-		if strings.HasPrefix(s, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func parseSubagentArgs(args json.RawMessage) subagentInvocation {
-	if len(args) == 0 {
-		return subagentInvocation{}
-	}
-	var p struct {
-		Agent string `json:"agent"`
-		Task  string `json:"task"`
-	}
-	if json.Unmarshal(args, &p) == nil && p.Agent != "" {
-		return subagentInvocation{agent: p.Agent, task: p.Task}
-	}
-	return subagentInvocation{}
 }

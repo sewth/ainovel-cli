@@ -1,6 +1,9 @@
 package domain
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // Phase 表示小说创作阶段。
 type Phase string
@@ -57,6 +60,11 @@ type Progress struct {
 	// 不增减结构，故排空后应按"结构完整即重新完结"放行（避免终卷末伏笔被返工扰动后卡在
 	// writing → 越界续写死循环）；正向写作不置此标记，完结判定保持线索收束的保守语义。
 	ReopenedFromComplete bool `json:"reopened_from_complete,omitempty"`
+	// ReopenCount 记录本书从完结态被重开的累计次数（/reopen 审计事实）。它同时保证
+	// 重开后的再完结与上次完结的 progress.json 内容不同：checkpoint 对同 digest 幂等
+	// 去重，字节相同的再完结不会产生新 checkpoint，StopGuard 会把成功的 complete_book
+	// 误判为空转并升级终止。
+	ReopenCount int `json:"reopen_count,omitempty"`
 }
 
 // IsResumable 判断是否可以从断点恢复。
@@ -203,31 +211,67 @@ func NewArchitectMemoryPolicy() MemoryPolicy {
 
 // RunMeta 运行元信息，持久化到 meta/run.json。
 type RunMeta struct {
-	StartedAt    string       `json:"started_at"`
-	Provider     string       `json:"provider,omitempty"`
-	Style        string       `json:"style"`
-	Model        string       `json:"model"`
-	PlanningTier PlanningTier `json:"planning_tier,omitempty"`
-	SteerHistory []SteerEntry `json:"steer_history,omitempty"`
-	PendingSteer string       `json:"pending_steer,omitempty"` // 未完成的 Steer 指令，中断恢复时重新注入
+	StartedAt            string             `json:"started_at"`
+	Provider             string             `json:"provider,omitempty"`
+	Style                string             `json:"style"`
+	Model                string             `json:"model"`
+	PlanningTier         PlanningTier       `json:"planning_tier,omitempty"`
+	StartPrompt          string             `json:"start_prompt,omitempty"`           // 用户原始创作需求（输入事实，先于启动裁定落盘；裁定失败后据此补裁）
+	PlanStart            *PlanStartRecord   `json:"plan_start,omitempty"`             // 启动裁定事实，规划期崩溃恢复的唯一依据
+	PendingSteer         string             `json:"pending_steer,omitempty"`          // 未完成的 Steer 指令，中断恢复时重新注入
+	AdvanceMode          ChapterAdvanceMode `json:"advance_mode"`                     // 章节推进模式：auto / review
+	AdvancePermitChapter int                `json:"advance_permit_chapter,omitempty"` // review 模式下一次性许可的正向章节
+	AdvanceHold          *AdvanceHold       `json:"advance_hold,omitempty"`           // 当前干预签署的一次性暂停意图
 }
 
-// SteerEntry 用户干预记录。
-type SteerEntry struct {
-	Input     string `json:"input"`
-	Timestamp string `json:"timestamp"`
+// ChapterAdvanceMode 决定新章节是否需要逐章许可。
+type ChapterAdvanceMode string
+
+const (
+	ChapterAdvanceAuto   ChapterAdvanceMode = "auto"
+	ChapterAdvanceReview ChapterAdvanceMode = "review"
+)
+
+// Valid 报告章节推进模式是否受当前版本支持。
+func (m ChapterAdvanceMode) Valid() bool {
+	return m == ChapterAdvanceAuto || m == ChapterAdvanceReview
 }
 
-// UserDirective 用户下达的长效创作要求，跨章节持续生效。
-// 持久化到 meta/user_directives.json，由 novel_context 注入
-// working_memory.user_directives 供所有子代理遵守。
-//
-// Chapter/TotalChapters 是下达时的进度快照：让指令有明确的生效起点（不追溯
-// 之前的章节），也让误存的相对式指令（如"增加10章"）可被读取方判定为已满足，
-// 而不是每次重读都再执行一次。
-type UserDirective struct {
-	Text          string `json:"text"`
-	Chapter       int    `json:"chapter"`        // 下达时的写作进度
-	TotalChapters int    `json:"total_chapters"` // 下达时的规划总章数
-	CreatedAt     string `json:"created_at"`     // RFC3339
+// UnsupportedAdvanceModeError 表示书的控制模式不受当前二进制支持。
+// 调用方必须停止构造可写 Host，并提示用户使用匹配版本；禁止猜测降级。
+type UnsupportedAdvanceModeError struct {
+	Mode ChapterAdvanceMode
+}
+
+func (e *UnsupportedAdvanceModeError) Error() string {
+	return fmt.Sprintf("不支持的章节推进模式 %q，请使用创建该项目的新版 ainovel", e.Mode)
+}
+
+// AdvanceHoldAfter 是一次性暂停的确定性触发条件。
+type AdvanceHoldAfter string
+
+const (
+	AdvanceHoldAtBoundary           AdvanceHoldAfter = "boundary"
+	AdvanceHoldAfterRewritesDrained AdvanceHoldAfter = "rewrites_drained"
+)
+
+// Valid 报告暂停条件是否受当前版本支持。
+func (a AdvanceHoldAfter) Valid() bool {
+	return a == AdvanceHoldAtBoundary || a == AdvanceHoldAfterRewritesDrained
+}
+
+// AdvanceHold 是当前干预签署的一次性暂停意图，由 Host 边界消费。
+type AdvanceHold struct {
+	After  AdvanceHoldAfter `json:"after"`
+	Reason string           `json:"reason"`
+}
+
+// PlanStartRecord 启动裁定的持久化事实(裁定先落事实,再起执行;恢复不重新裁定)。
+// 首个 save_foundation 落盘 scale 后,规划期恢复改由 PlanningTier 推导,本记录
+// 只覆盖"裁定完成到首次落盘之间"的窗口。DecisionID 关联 decisions.jsonl 审计。
+type PlanStartRecord struct {
+	RawPrompt   string `json:"raw_prompt"`
+	Planner     string `json:"planner"`
+	PlannerTask string `json:"planner_task"`
+	DecisionID  string `json:"decision_id,omitempty"`
 }

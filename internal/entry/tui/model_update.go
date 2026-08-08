@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -12,7 +14,14 @@ import (
 	"github.com/voocel/ainovel-cli/internal/utils"
 )
 
+const maxPromptEventCols = 160
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// body 高度依赖顶栏/底栏的实时高度（新建页模式栏、多行输入都会改变它），
+	// 每条消息前同步一次，避免 viewport 停在旧高度、面板底部补空行。幂等且廉价。
+	if m.width > 0 {
+		m.updateViewportSize()
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -57,10 +66,10 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleOverlayKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 	switch {
-	case m.askState != nil:
-		return m.handleBlockingModalKey(msg, m.handleAskUserKey)
 	case m.cocreate != nil:
 		return m.handleBlockingModalKey(msg, m.handleCoCreateKey)
+	case m.modelConfig != nil:
+		return m.handleBlockingModalKey(msg, m.handleModelConfigKey)
 	case m.help != nil:
 		return m.handleBlockingModalKey(msg, m.handleHelpKey)
 	case m.modelSwitch != nil:
@@ -109,6 +118,9 @@ func (m Model) toggleMouseReporting() (Model, tea.Cmd) {
 	}
 	return m, tea.EnableMouseCellMotion
 }
+
+// donePlaceholder 完成态输入框提示：会话内完结（doneMsg）与重启进完结书（bootstrap）共用。
+const donePlaceholder = "创作已完成 · 可输入返工要求(如\"重写第3章\")、/reopen 续写新卷、/export 导出"
 
 // enterRunning 进入创作工作台：开启鼠标上报（工作台需要点击切面板 / 滚轮 /
 // 拖拽侧边栏）。返回的命令需由调用方 Batch 进最终返回值。
@@ -301,7 +313,8 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 				m.err = err
 				return m, nil
 			}
-			return m, startRuntime(m.runtime, plan)
+			cmd := m.enterStarting(plan.RawPrompt)
+			return m, tea.Batch(startRuntime(m.runtime, plan), cmd)
 		}
 		m.cocreate = newCoCreateState(text)
 		return m, m.sendCoCreate()
@@ -314,8 +327,8 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 		return m, steerRuntime(m.runtime, text)
 	case modeDone:
 		// 完结后用户输入（返工/续写诉求）：唤醒新一轮 run。Continue 在停机态走 Inject
-		// 自动恢复，Coordinator 收到 [用户干预] 后按 coordinator.md 路由——要求返工已写章
-		// 则调 reopen_book 把书重开进返工态。切回 modeRunning 重入工作台；本轮跑完
+		// 自动恢复，Arbiter 裁定用户干预；返工已写章时由 Engine 重开全书并入队。
+		// 切回 modeRunning 重入工作台；本轮跑完
 		// doneMsg(complete) 会再置 modeDone。斜杠命令已在上面提前处理，不经此分支。
 		m.mode = modeRunning
 		return m, continueRuntime(m.runtime, text)
@@ -374,7 +387,7 @@ func (m Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 	}
-	if m.modelSwitch != nil || m.askState != nil {
+	if m.modelSwitch != nil || m.modelConfig != nil {
 		return m, nil
 	}
 	if pane, ok := m.paneAtMouse(msg.X, msg.Y); ok {
@@ -425,21 +438,23 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			m.err = msg.err
 			return m, fetchSnapshot(m.runtime), true
 		}
-		if msg.resumed && m.mode == modeNew {
+		// modeNew：启动恢复/导入完成落台；modeDone：/reopen 重开后回到创作台。
+		if msg.resumed && (m.mode == modeNew || m.mode == modeDone) {
 			enableMouse := m.enterRunning()
 			m.resizeTextarea()
 			m.textarea.Placeholder = defaultSteerPlaceholder()
 			return m, tea.Batch(fetchSnapshot(m.runtime), enableMouse), true
 		}
+		// 完结书：落完成态工作台（enterRunning 开鼠标后改 modeDone），不落欢迎页——
+		// 欢迎页对已有书只字不提，用户会以为书丢了；/reopen、/export、返工输入都在工作台。
+		if msg.completed && m.mode == modeNew {
+			enableMouse := m.enterRunning()
+			m.mode = modeDone
+			m.resizeTextarea()
+			m.textarea.Placeholder = donePlaceholder
+			return m, tea.Batch(fetchSnapshot(m.runtime), enableMouse, m.textarea.Focus()), true
+		}
 		return m, fetchSnapshot(m.runtime), true
-	case askUserMsg:
-		m.askState = newAskUserState(askUserRequest(msg))
-		m.textarea.Blur()
-		m.applyEvent(host.Event{
-			Time: time.Now(), Category: "SYSTEM", Summary: "等待用户补充关键信息", Level: "info",
-		})
-		m.refreshEventViewport()
-		return m, listenAskUser(m.askBridge), true
 	case snapshotMsg:
 		m.snapshot = host.UISnapshot(msg)
 		m.syncRuntimePlaceholder()
@@ -457,9 +472,9 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			m.abortPending = false
 			m.mode = modeDone
 			// 完成态不锁输入框：停止自动续写，但用户仍可输入返工要求（modeDone 输入经
-			// Continue 唤醒新一轮 run，Coordinator 路由到 reopen_book），/export、/model
+			// Continue 唤醒新一轮 run，Arbiter 裁定返工或继续创作；/export、/model
 			// 等命令也需可用，输入框必须保持聚焦（issue #27、#38）。
-			m.textarea.Placeholder = "创作已完成 · 可输入返工要求(如\"重写第3章\")、/export 导出，或输入 / 看命令"
+			m.textarea.Placeholder = donePlaceholder
 			return m, tea.Batch(fetchSnapshot(m.runtime), listenDone(m.runtime), m.textarea.Focus()), true
 		}
 		if m.abortPending {
@@ -481,7 +496,7 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		boxW, _ := reportModalSize(m.width, m.height)
-		m.report.load(msg.report, paddedModalContentWidth(boxW), msg.exportPath, msg.finishedAt)
+		m.report.load(msg.report, paddedModalContentWidth(boxW), msg.exportPath, msg.exportErr, msg.finishedAt)
 		return m, nil, true
 	case importEventMsg:
 		if m.importer == nil || msg.reqID != m.importer.reqID {
@@ -493,12 +508,29 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		if msg.ev.Stage == imp.StageDone {
-			// 导入成功 → 自动接力续写：Resume 会启用 Router 并派发首条指令，
-			// 走与"重开项目恢复"完全一致的续写流程（补上同会话导入→续写的衔接）。
-			// 随后的 bootstrapMsg 处理会 enterRunning() 切到创作态。
-			return m, bootstrapRuntime(m.runtime), true
+			if msg.ev.Continued {
+				// host 已真实启动 Engine 自动接力（Continued 由 host 依权威决策置位，非 TUI 臆测）。
+				// 关面板落到工作台，由 Init 常驻的 listenEvents/listenDone 承接引擎事件，tickSnapshot 刷新运行态。
+				m.importer = nil
+				enableMouse := m.enterRunning()
+				m.resizeTextarea()
+				m.textarea.Placeholder = defaultSteerPlaceholder()
+				return m, tea.Batch(enableMouse, m.textarea.Focus()), true
+			}
+			// 未接力（默认/审阅/接力失败）：停在面板等用户核对 Foundation 与章节，Esc 关闭。
+			return m, nil, true
 		}
 		return m, listenImportEvent(msg.reqID, msg.ch), true
+	case importClosedMsg:
+		// 通道关闭且未终态 → 管线在 awaiting 处停下（等 --yes / --story）。标记面板可关闭，
+		// 否则 Esc 只会取消已结束的 ctx，面板永远关不掉（卡死）。
+		if m.importer == nil || msg.reqID != m.importer.reqID || m.importer.done {
+			return m, nil, true
+		}
+		m.importer.paused = true
+		boxW, _ := reportModalSize(m.width, m.height)
+		m.importer.refresh(paddedModalContentWidth(boxW))
+		return m, nil, true
 	case simEventMsg:
 		if m.simulator == nil || msg.reqID != m.simulator.reqID {
 			return m, nil, true
@@ -521,6 +553,31 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		}
 		m.refreshEventViewport()
 		return m, nil, true
+	case modelConfigSavedMsg:
+		if m.modelConfig == nil {
+			return m, nil, true
+		}
+		if msg.err != nil {
+			m.modelConfig.saving = false
+			m.modelConfig.message = msg.err.Error()
+			return m, nil, true
+		}
+		m.modelConfig = nil
+		return m, tea.Batch(fetchSnapshot(m.runtime), m.textarea.Focus()), true
+	case modelConfigConnectionMsg:
+		if m.modelConfig == nil {
+			return m, nil, true
+		}
+		m.modelConfig.testing = false
+		m.modelConfig.testCancel = nil
+		if errors.Is(msg.err, context.Canceled) {
+			m.modelConfig.message = "连接测试已取消"
+		} else if msg.err != nil {
+			m.modelConfig.message = msg.err.Error()
+		} else {
+			m.modelConfig.message = "连接测试成功：" + msg.model
+		}
+		return m, nil, true
 	case startResultMsg:
 		next, cmd := m.handleStartResultMsg(msg)
 		return next, cmd, true
@@ -534,6 +591,12 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		next, cmd := m.handleCoCreateDoneMsg(msg)
 		return next, cmd, true
 	case steerResultMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			m.applyEvent(host.Event{Time: time.Now(), Category: "ERROR", Summary: msg.err.Error(), Level: "error"})
+			m.refreshEventViewport()
+			return m, tea.Batch(fetchSnapshot(m.runtime), m.textarea.Focus()), true
+		}
 		return m, tea.Batch(fetchSnapshot(m.runtime), listenDone(m.runtime)), true
 	case continueResultMsg:
 		if msg.err != nil {
@@ -557,9 +620,9 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 	case toolSpinnerTickMsg:
 		m.toolSpinnerIdx = (m.toolSpinnerIdx + 1) % len(toolSpinnerFrames)
 		// 事件流"进行中"行的 spinner 刷新（150ms，独立节奏）。
-		// spinner 帧只影响 running 事件行，已完成行的渲染输出 byte-for-byte 相同；
-		// 没有 running 事件时整个重渲是无意义的，跳过。
-		if m.snapshot.IsRunning && m.hasRunningEvent() {
+		// Arbiter 可在 Engine 停机态处理 Continue/查询，因此不能用 snapshot.IsRunning
+		// 作为动画前提；只要存在调用类 running 事件就刷新。没有时跳过全量重渲。
+		if m.hasRunningEvent() {
 			m.refreshEventViewport()
 		}
 		return m, tickToolSpinner(), true
@@ -570,6 +633,13 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			// 顺便把 dirty 一并清掉，flush tick 紧跟着不必重复刷。
 			m.refreshStreamViewport()
 			m.streamDirty = false
+		}
+		if s := m.importer; s != nil && !s.done && !s.paused {
+			// 导入运行中：尾随星标与重试倒计时都在 viewport 内容里，按 tick 重算。
+			// 挂在 cursor tick（120ms）上与流式面板光标同速——同款星星不该一快一慢。
+			s.frame = m.cursorIdx
+			boxW, _ := reportModalSize(m.width, m.height)
+			s.refresh(paddedModalContentWidth(boxW))
 		}
 		return m, tickCursor(), true
 	case streamDeltaMsg:
@@ -614,6 +684,8 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 func (m Model) handleStartResultMsg(msg startResultMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		m.err = msg.err
+		wasStarting := m.starting
+		m.starting = false
 		if m.mode != modeNew {
 			m.applyEvent(host.Event{
 				Time: time.Now(), Category: "ERROR", Summary: msg.err.Error(), Level: "error",
@@ -625,12 +697,24 @@ func (m Model) handleStartResultMsg(msg startResultMsg) (tea.Model, tea.Cmd) {
 			m.textarea.Placeholder = placeholderForCoCreate(m.cocreate)
 			return m, tea.Batch(fetchSnapshot(m.runtime), m.textarea.Focus())
 		}
+		if wasStarting {
+			// 回车后已经进入工作台；启动阶段的 LLM 错误就在当前工作台展示，
+			// 不再退回欢迎页。
+			m.mode = modeRunning
+			m.snapshot.IsRunning = false
+			m.snapshot.RuntimeState = "idle"
+			m.textarea.Placeholder = "启动失败，请检查模型配置或使用 /model 切换模型"
+			m.refreshStreamViewport()
+			m.refreshStateViewport()
+			return m, m.textarea.Focus()
+		}
 		if m.mode == modeNew {
 			m.textarea.Placeholder = placeholderForNewMode(m.startupMode)
 			return m, tea.Batch(fetchSnapshot(m.runtime), m.textarea.Focus())
 		}
 		return m, fetchSnapshot(m.runtime)
 	}
+	m.starting = false
 
 	if m.mode == modeNew {
 		m.cocreate = nil
@@ -641,6 +725,40 @@ func (m Model) handleStartResultMsg(msg startResultMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, fetchSnapshot(m.runtime)
+}
+
+func (m *Model) enterStarting(rawPrompt string) tea.Cmd {
+	m.cocreate = nil
+	m.err = nil
+	m.starting = true
+	m.snapshot.IsRunning = true
+	m.snapshot.RuntimeState = "running"
+	enableMouse := m.enterRunning()
+	m.resetOutputPanels()
+	m.resizeTextarea()
+	m.textarea.Placeholder = "正在初始化创作..."
+	m.applyStartupPromptEvent(rawPrompt)
+	m.applyEvent(host.Event{
+		Time: time.Now(), Category: "SYSTEM", Summary: "正在初始化创作", Level: "info",
+	})
+	m.refreshEventViewport()
+	m.refreshStreamViewport()
+	m.refreshStateViewport()
+	return tea.Batch(m.textarea.Focus(), enableMouse)
+}
+
+func (m *Model) applyStartupPromptEvent(rawPrompt string) {
+	text := utils.CleanInputLine(rawPrompt)
+	if text == "" {
+		return
+	}
+	m.applyEvent(host.Event{
+		Time:     time.Now(),
+		Category: "USER",
+		Summary:  "创作需求: " + truncate(text, maxPromptEventCols),
+		Detail:   text,
+		Level:    "info",
+	})
 }
 
 func (m Model) handleCoCreateDoneMsg(msg cocreateDoneMsg) (tea.Model, tea.Cmd) {
@@ -687,9 +805,19 @@ func (m *Model) applyEvent(ev host.Event) {
 			if ev.Level != "" {
 				existing.Level = ev.Level
 			}
+			if ev.Detail != "" {
+				existing.Detail = ev.Detail
+			}
+			if ev.Kind != "" {
+				existing.Kind = ev.Kind
+			}
 			// Summary 非空时允许覆盖（结束态可能带补充信息）；否则保留首次
 			if ev.Summary != "" {
 				existing.Summary = ev.Summary
+			}
+			// 重试事件同 ID 跨 attempt 更新，新截止时刻要跟上，倒计时才会随之重置
+			if !ev.RetryAt.IsZero() {
+				existing.RetryAt = ev.RetryAt
 			}
 			return
 		}

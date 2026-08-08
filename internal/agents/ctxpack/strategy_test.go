@@ -2,6 +2,8 @@ package ctxpack
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -73,6 +75,21 @@ func TestStoreSummaryCompactApplyUsesPersistentStoreData(t *testing.T) {
 	}
 }
 
+func TestWriterRestoreIncludesOptionalDataWarnings(t *testing.T) {
+	s := seededWriterStore(t)
+	if err := os.WriteFile(filepath.Join(s.Dir(), "meta", "style_rules.json"), []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	text, ok, err := buildWriterRestoreText(s, restoreBudgetTokens)
+	if err != nil {
+		t.Fatalf("辅助数据损坏不应阻止恢复上下文: %v", err)
+	}
+	if !ok || !strings.Contains(text, "数据告警") || !strings.Contains(text, "style_rules") {
+		t.Fatalf("恢复上下文应向模型暴露读取告警: %q", text)
+	}
+}
+
 func TestStoreSummaryCompactApplyFallsBackWhenStoreDataInsufficient(t *testing.T) {
 	dir := t.TempDir()
 	s := storepkg.NewStore(dir)
@@ -118,7 +135,10 @@ func TestWriterRestorePackRefreshReusesStoreBuilder(t *testing.T) {
 	pack := &WriterRestorePack{}
 	pack.Refresh(s)
 
-	msg, ok := pack.buildMessage(restoreBudgetTokens)
+	msg, ok, err := pack.buildMessage(restoreBudgetTokens)
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
 	if !ok {
 		t.Fatal("expected restore pack message")
 	}
@@ -131,6 +151,10 @@ func TestWriterRestorePackRefreshReusesStoreBuilder(t *testing.T) {
 	}
 	if !strings.Contains(text, "当前章节计划") {
 		t.Fatalf("expected chapter plan section, got %q", text)
+	}
+
+	if _, _, err := pack.buildMessage(0); err == nil {
+		t.Fatal("expected an explicit error when the restore pack does not fit")
 	}
 }
 

@@ -1,9 +1,9 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -11,7 +11,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/voocel/ainovel-cli/internal/host"
-	"github.com/voocel/ainovel-cli/internal/tools"
 	"github.com/voocel/ainovel-cli/internal/utils"
 )
 
@@ -53,11 +52,10 @@ var toolSpinnerFrames = []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯"
 // Model 是 TUI 的顶层状态。
 type Model struct {
 	runtime        *host.Host
-	askBridge      *askUserBridge
-	askState       *askUserState
 	cocreate       *cocreateState
 	help           *helpState
 	modelSwitch    *modelSwitchState
+	modelConfig    *modelConfigState
 	report         *reportState
 	version        string
 	importer       *importState
@@ -67,6 +65,7 @@ type Model struct {
 	compItems      []commandPaletteItem
 	compIdx        int
 	compActive     bool
+	commandToken   string // 当前已注册的命令 token；仅渲染该段，不染参数
 	snapshot       host.UISnapshot
 	events         []host.Event
 	eventIndex     map[string]int   // event.ID → m.events 下标；调用类事件到达时原地更新
@@ -90,7 +89,9 @@ type Model struct {
 	hoverPane      focusPane
 	hoverActive    bool
 	mode           appMode
+	starting       bool // UI 已进入工作台，Host 正在执行启动初始化
 	startupMode    startupMode
+	importHint     string // 启动时检测到未完成导入的提示（欢迎屏显示；发起导入后清空）
 	cocreateSeq    int
 	reportSeq      int
 	err            error
@@ -104,10 +105,10 @@ type Model struct {
 }
 
 // NewModel 创建 TUI Model。
-func NewModel(rt *host.Host, bridge *askUserBridge, version string) Model {
+func NewModel(rt *host.Host, version string) Model {
 	ta := textarea.New()
 	ta.Placeholder = placeholderForNewMode(startupModeQuick)
-	ta.CharLimit = 2000
+	ta.CharLimit = 5000
 	ta.SetHeight(1)
 	// MaxHeight=6 让超长输入按宽度自动 wrap 显示成多行（视觉上限 6 行）。
 	ta.MaxHeight = 6
@@ -131,14 +132,21 @@ func NewModel(rt *host.Host, bridge *askUserBridge, version string) Model {
 	stvp := viewport.New(32, 20)
 	stvp.SetContent("")
 
+	// 启动时检测一次未完成导入（LoadState 重算工件 digest，不进快照轮询）；
+	// 半路书若不主动告知，用户只有在创作被门禁拒绝时才会发现（RFC §18.2）。
+	importHint := ""
+	if rt != nil {
+		importHint = rt.ImportResumeHint()
+	}
+
 	return Model{
 		runtime:      rt,
-		askBridge:    bridge,
 		version:      strings.TrimSpace(version),
 		autoScroll:   true,
 		streamScroll: true,
 		mode:         modeNew,
 		startupMode:  startupModeQuick,
+		importHint:   importHint,
 		textarea:     ta,
 		viewport:     vp,
 		streamVP:     svp,
@@ -153,7 +161,6 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		textarea.Blink,
 		listenEvents(m.runtime),
-		listenAskUser(m.askBridge),
 		listenDone(m.runtime),
 		listenStream(m.runtime),
 		tickSnapshot(m.runtime),
@@ -234,7 +241,11 @@ func (m *Model) flushStreamIfDirty() bool {
 func (m *Model) refreshEventViewport() {
 	centerW := m.eventFlowWidth()
 	content := renderEventContent(m.events, centerW, m.toolSpinnerIdx)
-	if activity := renderEventActivity(m.snapshot, m.spinnerIdx, centerW); activity != "" {
+	snap := m.snapshot
+	if m.starting {
+		snap.IsRunning = true
+	}
+	if activity := renderEventActivity(snap, m.spinnerIdx, centerW); activity != "" {
 		if strings.TrimSpace(content) != "" {
 			content += "\n" + activity
 		} else {
@@ -287,7 +298,11 @@ func (m *Model) updateViewportSize() {
 	m.detailVP.Height = bodyH
 	leftW := m.sidebarWidth()
 	m.stateVP.Width = max(1, leftW-2)
-	m.stateVP.Height = max(1, bodyH-2) // -2 为状态栏 Padding(1,1) 的上下留白
+	m.stateVP.Height = max(1, bodyH-1) // -1 为顶部留白，底行直接显示内容
+	// 高度或内容变短后，自由滚动的左右两栏可能停在越界偏移上（bubbles 的
+	// SetContent 只防越过末行），viewport 会用空行补满底部。SetYOffset 自钳。
+	m.stateVP.SetYOffset(m.stateVP.YOffset)
+	m.detailVP.SetYOffset(m.detailVP.YOffset)
 }
 
 // splitHeights 计算事件流和流式输出的高度分配。
@@ -395,6 +410,7 @@ func (m *Model) tryHistoryUp() bool {
 	m.historyIdx--
 	m.textarea.SetValue(m.inputHistory[m.historyIdx])
 	m.textarea.CursorEnd()
+	m.syncCommandInputHighlight()
 	m.refitTextareaHeight()
 	return true
 }
@@ -412,6 +428,7 @@ func (m *Model) tryHistoryDown() bool {
 		m.textarea.SetValue(m.inputHistory[m.historyIdx])
 	}
 	m.textarea.CursorEnd()
+	m.syncCommandInputHighlight()
 	m.refitTextareaHeight()
 	return true
 }
@@ -429,11 +446,12 @@ func (m *Model) inputHints() string {
 	if m.quitPending {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Bold(true).Render("Press Ctrl+C again to exit")
 	}
+	limitHint := m.inputLimitHint()
 	// 欢迎页(modeNew)不开鼠标上报，终端原生拖拽即可复制，无需 Ctrl+R 提示；
 	// 工作台才开上报，复制需 Ctrl+R 临时关闭。
-	suffix := " · Ctrl+R 切到选中复制模式"
+	suffix := limitHint + " · Ctrl+R 切到选中复制模式"
 	if m.mode == modeNew {
-		suffix = ""
+		suffix = limitHint
 	}
 	if m.mouseOff && m.mode != modeNew {
 		// 工作台手动切到选中复制：用强调色提示当前处于"自由拖拽选中"状态，按 Ctrl+R 恢复
@@ -473,6 +491,18 @@ func (m *Model) inputHints() string {
 	return dimStyle.Render("输入 / 搜索命令 · 点击/Tab 切换面板 · ↑↓ 滚动 · End 跳底 · Ctrl+L 清屏 · Esc 暂停 · Enter 发送" + suffix)
 }
 
+func (m *Model) inputLimitHint() string {
+	limit := m.textarea.CharLimit
+	if limit <= 0 {
+		return ""
+	}
+	used := m.textarea.Length()
+	if used < limit*4/5 {
+		return ""
+	}
+	return fmt.Sprintf(" · 输入 %d/%d", used, limit)
+}
+
 func (m *Model) eventFlowWidth() int {
 	if m.width == 0 {
 		return 80
@@ -502,7 +532,7 @@ func (m *Model) bodyHeight() int {
 }
 
 func (m *Model) currentSpinnerFrame() string {
-	if !m.snapshot.IsRunning {
+	if !m.snapshot.IsRunning && !m.starting {
 		return ""
 	}
 	return spinnerFrames[m.spinnerIdx%len(spinnerFrames)]
@@ -523,16 +553,28 @@ func (m *Model) syncRuntimePlaceholder() {
 	if m.mode != modeRunning || m.cocreate != nil {
 		return
 	}
+	if m.starting {
+		m.textarea.Placeholder = "正在初始化创作..."
+		return
+	}
 	switch m.snapshot.RuntimeState {
 	case "completed":
-		m.textarea.Placeholder = "创作已完成"
+		m.textarea.Placeholder = donePlaceholder
 	case "pausing":
 		m.textarea.Placeholder = "正在暂停创作..."
 	case "paused":
-		m.textarea.Placeholder = "创作已暂停，输入任意内容继续创作"
+		if m.snapshot.AdvanceMode == "review" && m.snapshot.Phase == "writing" {
+			m.textarea.Placeholder = "逐章验收等待中：输入修改意见，或 /next 放行下一章"
+		} else {
+			m.textarea.Placeholder = "创作已暂停，输入任意内容继续创作"
+		}
 	default:
 		if !m.snapshot.IsRunning {
-			m.textarea.Placeholder = "运行中断，输入任意内容恢复创作"
+			if m.snapshot.AdvanceMode == "review" && m.snapshot.Phase == "writing" {
+				m.textarea.Placeholder = "逐章验收等待中：输入修改意见，或 /next 放行下一章"
+			} else {
+				m.textarea.Placeholder = "运行中断，输入任意内容恢复创作"
+			}
 		} else {
 			m.textarea.Placeholder = defaultSteerPlaceholder()
 		}
@@ -540,8 +582,9 @@ func (m *Model) syncRuntimePlaceholder() {
 }
 
 func (m *Model) renderBottomBar() string {
+	inputView := highlightCommandToken(m.textarea.View(), m.textarea.Value(), m.commandToken)
 	inputBox := renderInputBox(
-		m.textarea.View(),
+		inputView,
 		m.inputHints(),
 		m.snapshot,
 		m.outputDir(),
@@ -577,9 +620,6 @@ func (m Model) View() string {
 			AlignVertical(lipgloss.Center).
 			Render("终端宽度不足，请至少扩展到 100 列")
 	}
-	if m.askState != nil {
-		return renderAskUserModal(m.width, m.height, m.askState)
-	}
 	if m.cocreate != nil {
 		return renderCoCreateModal(m.width, m.height, m.cocreate, errorText(m.err), m.textarea.View(), m.spinnerIdx, m.quitPending)
 	}
@@ -590,7 +630,8 @@ func (m Model) View() string {
 		return renderReportModal(m.width, m.height, m.report)
 	}
 	if m.importer != nil {
-		return renderImportModal(m.width, m.height, m.importer)
+		// 导入不依赖 Engine 运行态，动画帧直接取 spinnerIdx（currentSpinnerFrame 在引擎停机时返回空）。
+		return renderImportModal(m.width, m.height, m.importer, m.spinnerIdx)
 	}
 	if m.simulator != nil {
 		return renderSimulationModal(m.width, m.height, m.simulator)
@@ -606,7 +647,7 @@ func (m Model) View() string {
 		if m.err != nil {
 			errMsg = m.err.Error()
 		}
-		body = renderWelcome(m.width, bodyH, errMsg, m.startupMode)
+		body = renderWelcome(m.width, bodyH, errMsg, m.startupMode, m.importHint)
 	} else {
 		leftW := m.sidebarWidth()
 		rightW := m.detailWidth()
@@ -623,7 +664,7 @@ func (m Model) View() string {
 		}
 
 		eventFlow := renderEventFlowViewport(m.viewport, centerW, eventH, m.paneHighlighted(focusEvents))
-		streamPanel := renderStreamPanel(m.streamVP, centerW, streamH, m.paneHighlighted(focusStream), m.snapshot.IsRunning, m.spinnerIdx)
+		streamPanel := renderStreamPanel(m.streamVP, centerW, streamH, m.paneHighlighted(focusStream), m.snapshot.IsRunning || m.starting, m.spinnerIdx)
 		center := lipgloss.JoinVertical(lipgloss.Left, eventFlow, streamPanel)
 
 		left := renderStatePanel(m.stateVP, leftW, bodyH, m.paneHighlighted(focusState))
@@ -637,6 +678,8 @@ func (m Model) View() string {
 	if m.modelSwitch != nil {
 		commandBar := renderModelSwitchBar(m.width, m.modelSwitch)
 		view = overlayAboveInput(view, commandBar, inputH)
+	} else if m.modelConfig != nil {
+		view = overlayAboveInput(view, renderModelConfigModal(m.width, m.modelConfig), inputH)
 	} else if m.compActive {
 		commandBar := renderCommandPalette(m.width, m.compItems, m.compIdx)
 		view = overlayAboveInput(view, commandBar, inputH)
@@ -737,9 +780,8 @@ func (m Model) handleCoCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = err
 			return m, nil
 		}
-		state.awaiting = true
-		m.textarea.Blur()
-		return m, startRuntime(m.runtime, plan)
+		cmd := m.enterStarting(plan.RawPrompt)
+		return m, tea.Batch(startRuntime(m.runtime, plan), cmd)
 	case tea.KeyEnter:
 		// Alt+Enter → 主动换行，让 textarea.Update 接管（KeyMap.InsertNewline 已绑此键）
 		if msg.Alt {
@@ -750,6 +792,7 @@ func (m Model) handleCoCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// 导致 "abc\ndef" 被吞成 "abcdef"，与 base 路径语义不一致。
 		if !m.lastKeyAt.IsZero() && time.Since(m.lastKeyAt) < 50*time.Millisecond {
 			var cmd tea.Cmd
+			state.resetSuggestionInput()
 			m.textarea, cmd = m.textarea.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 			m.refitTextareaHeight()
 			return m, cmd
@@ -769,22 +812,21 @@ func (m Model) handleCoCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cmd := m.sendCoCreate()
 		return m, cmd
 	case tea.KeyCtrlU:
+		state.resetSuggestionInput()
 		m.textarea.Reset()
 		m.refitTextareaHeight()
 		return m, nil
 	}
 
-	// 数字键 1/2/3 在 textarea 为空且有建议时 → 填入对应建议（不发送，可编辑）。
-	// 仅在空输入框时拦截，避免影响用户主动打数字。awaiting 时建议不展示，
-	// 这里也无需额外判断（state.suggestions 为空即跳过）。
+	// 数字键 1/2/3 可连续组合建议：首次填入，后续用分号追加，重复选择忽略。
+	// 任意手动编辑都会退出快捷组合状态，之后的数字保持普通输入语义。
 	if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && !state.awaiting {
 		if r := msg.Runes[0]; r >= '1' && r <= '3' {
-			if strings.TrimSpace(m.textarea.Value()) == "" {
-				if sugs := state.suggestions(); int(r-'0') <= len(sugs) {
-					m.textarea.SetValue(sugs[r-'1'])
-					m.refitTextareaHeight()
-					return m, nil
-				}
+			if value, handled := state.appendSuggestion(int(r-'1'), m.textarea.Value()); handled {
+				m.textarea.SetValue(value)
+				m.textarea.CursorEnd()
+				m.refitTextareaHeight()
+				return m, nil
 			}
 		}
 	}
@@ -797,6 +839,7 @@ func (m Model) handleCoCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg, ok = cleanHumanKeyRunes(msg); !ok {
 		return m, nil
 	}
+	state.resetSuggestionInput()
 	if msg.Type == tea.KeyRunes {
 		m.lastKeyAt = time.Now()
 	}
@@ -824,83 +867,6 @@ func (m Model) exitCoCreate() (tea.Model, tea.Cmd) {
 	m.textarea.SetValue(initial)
 	m.textarea.Placeholder = placeholderForNewMode(m.startupMode)
 	return m, m.textarea.Focus()
-}
-
-func (m Model) handleAskUserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.askState == nil {
-		return m, nil
-	}
-	state := m.askState
-	q := state.currentQuestion()
-
-	if state.typing {
-		switch msg.Type {
-		case tea.KeyEsc:
-			state.cancelCurrentTyping()
-			return m, nil
-		case tea.KeyEnter:
-			if state.finishCurrentAnswer() {
-				state.submit()
-				m.askState = nil
-				return m, m.textarea.Focus()
-			}
-			return m, nil
-		case tea.KeyBackspace, tea.KeyCtrlH:
-			if state.input != "" {
-				_, size := utf8.DecodeLastRuneInString(state.input)
-				state.input = state.input[:len(state.input)-size]
-			}
-			return m, nil
-		default:
-			if msg.Type == tea.KeyRunes {
-				state.input += utils.CleanInputRunes(msg.Runes)
-			}
-			return m, nil
-		}
-	}
-
-	switch msg.Type {
-	case tea.KeyEsc:
-		// 关闭弹窗，返回空答案
-		state.request.resultCh <- askUserResult{
-			resp: &tools.AskUserResponse{
-				Answers: make(map[string]string),
-				Notes:   make(map[string]string),
-			},
-		}
-		m.askState = nil
-		return m, m.textarea.Focus()
-	case tea.KeyUp:
-		state.moveCursor(-1)
-	case tea.KeyDown:
-		state.moveCursor(1)
-	case tea.KeySpace:
-		if q.MultiSelect {
-			state.toggleSelection()
-			if state.cursor == len(q.Options) && !state.selected[state.cursor] {
-				state.input = ""
-			}
-		}
-	case tea.KeyEnter:
-		if q.MultiSelect {
-			if state.cursor == len(q.Options) {
-				state.toggleSelection()
-				if state.selected[state.cursor] {
-					state.typing = true
-				}
-				return m, nil
-			}
-			if len(state.selected) == 0 {
-				state.toggleSelection()
-			}
-		}
-		if state.finishCurrentAnswer() {
-			state.submit()
-			m.askState = nil
-			return m, m.textarea.Focus()
-		}
-	}
-	return m, nil
 }
 
 // overlayAboveInput 将 overlay 浮动叠加在 base 视图的底部（inputBox 上方），

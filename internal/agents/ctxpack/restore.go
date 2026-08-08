@@ -2,6 +2,7 @@ package ctxpack
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/voocel/agentcore"
@@ -117,7 +118,11 @@ func (p *WriterRestorePack) Refresh(s *store.Store) {
 		return
 	}
 	progress, err := s.Progress.Load()
-	if err != nil || progress == nil {
+	if err != nil {
+		p.setWarning("progress 读取失败", err)
+		return
+	}
+	if progress == nil {
 		p.Clear()
 		return
 	}
@@ -131,7 +136,11 @@ func (p *WriterRestorePack) Refresh(s *store.Store) {
 	}
 
 	text, ok, err := buildWriterRestoreText(s, restoreBudgetTokens)
-	if err != nil || !ok {
+	if err != nil {
+		p.setWarning("恢复上下文读取失败", err)
+		return
+	}
+	if !ok {
 		p.Clear()
 		return
 	}
@@ -140,6 +149,13 @@ func (p *WriterRestorePack) Refresh(s *store.Store) {
 	defer p.mu.Unlock()
 	p.chapter = ch
 	p.text = text
+}
+
+func (p *WriterRestorePack) setWarning(scope string, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.chapter = 0
+	p.text = fmt.Sprintf("<post-compact-context>\n## 数据告警\n%s：%v\n</post-compact-context>", scope, err)
 }
 
 // Clear drops cached data (e.g., when switching chapters).
@@ -153,8 +169,11 @@ func (p *WriterRestorePack) Clear() {
 // Hook returns a PostSummaryHook that injects the cached restore pack.
 // The hook performs no I/O — it only reads the in-memory pack under a read lock.
 func (p *WriterRestorePack) Hook() corecontext.PostSummaryHook {
-	return func(_ context.Context, _ corecontext.SummaryInfo, _ []agentcore.AgentMessage) ([]agentcore.AgentMessage, error) {
-		msg, ok := p.buildMessage(restoreBudgetTokens)
+	return func(_ context.Context, _ corecontext.SummaryInfo, _ []agentcore.AgentMessage, room int) ([]agentcore.AgentMessage, error) {
+		msg, ok, err := p.buildMessage(min(restoreBudgetTokens, room))
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			return nil, nil
 		}
@@ -162,20 +181,20 @@ func (p *WriterRestorePack) Hook() corecontext.PostSummaryHook {
 	}
 }
 
-// buildMessage assembles the restore message within the given token budget.
-// Items are added in priority order: plan → outline → snapshots.
-// Returns false if nothing to inject.
-func (p *WriterRestorePack) buildMessage(budgetTokens int) (agentcore.Message, bool) {
+// buildMessage returns the cached restore message when it fits.
+func (p *WriterRestorePack) buildMessage(budgetTokens int) (agentcore.Message, bool, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	if p.text == "" {
-		return agentcore.Message{}, false
+		return agentcore.Message{}, false, nil
 	}
-	if budgetTokens > 0 && corecontext.EstimateTokens(agentcore.UserMsg(p.text)) > budgetTokens {
-		return agentcore.Message{}, false
+	msg := agentcore.UserMsg(p.text)
+	required := corecontext.EstimateTokens(msg)
+	if required > budgetTokens {
+		return agentcore.Message{}, false, fmt.Errorf("writer restore pack requires %d tokens, only %d available", required, budgetTokens)
 	}
-	return agentcore.UserMsg(p.text), true
+	return msg, true, nil
 }
 
 // truncateJSONToTokens keeps the first portion of JSON bytes that fits within

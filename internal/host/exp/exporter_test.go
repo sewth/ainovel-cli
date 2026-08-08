@@ -23,6 +23,9 @@ func newTestStore(t *testing.T, novelName string, completed []int) (*store.Store
 	if err := s.Progress.Init(novelName, len(completed)); err != nil {
 		t.Fatalf("init progress: %v", err)
 	}
+	if err := s.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase writing: %v", err)
+	}
 	for _, ch := range completed {
 		if err := s.Drafts.SaveFinalChapter(ch, fmt.Sprintf("正文 ch %d。", ch)); err != nil {
 			t.Fatalf("save chapter %d: %v", ch, err)
@@ -73,6 +76,31 @@ func TestRun_HappyPath_DefaultsToNovelDir(t *testing.T) {
 	// premise 不进导出（创作蓝图，非读者内容）
 	if strings.Contains(text, "光与影的故事。") {
 		t.Errorf("premise must not appear in export:\n%s", text)
+	}
+}
+
+func TestRun_UsesCommittedTitleForCompletedChapter(t *testing.T) {
+	s, _ := newTestStore(t, "光斑", []int{1})
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "计划标题"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Summaries.SaveSummary(domain.ChapterSummary{
+		Chapter: 1, Title: "终稿标题", Summary: "摘要",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Run(context.Background(), Deps{Store: s}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(res.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "第 1 章  终稿标题") || strings.Contains(text, "计划标题") {
+		t.Fatalf("export title projection is wrong:\n%s", text)
 	}
 }
 

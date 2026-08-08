@@ -2,7 +2,8 @@
 //
 // 动机：弧内评审窗口（~10 章）对全书级模式固化天然失明——句式 tic 章均几十次、
 // 章末形态同构、跨章复读，单章看每处都"正常"，只有全书统计能暴露。统计归代码
-//（确定性、零幻觉），裁定归 LLM（editor 按数字判维度分，writer 据此自避免）。
+// （确定性、零幻觉），裁定归 LLM（editor 按数字判维度分，writer 据此自避免）。
+// Compute 供离线评测一次性全量计算；运行时使用 Tracker 按章节增量维护。
 package stylestat
 
 import (
@@ -78,6 +79,10 @@ var patternDefs = []struct {
 	{"计时量词『X息/X瞬』", regexp.MustCompile(`[一两二三四五六七八九十几数半][息瞬]`)},
 	{"明喻『像一/仿佛/如同/宛如』", regexp.MustCompile(`像一|仿佛|如同|宛如`)},
 	{"沉默节拍『沉默了/没有说话/没有回头』", regexp.MustCompile(`沉默了|没有说话|没有回头`)},
+	{"神态模板『眼中闪过/嘴角勾起/咬了咬唇』", regexp.MustCompile(`眼[中底]闪过|目光一凝|瞳孔一缩|眼眶微红|嘴角[微轻一]?[勾扬翘]|咬了咬唇|不可置信`)},
+	{"躯体反应『心头一紧/身子一颤/倒吸凉气』", regexp.MustCompile(`心头一[紧沉颤]|身子一[颤震僵]|倒吸(?:了)?一口凉气`)},
+	{"思维标记『心想/意识到/感到/觉得』", regexp.MustCompile(`心想|意识到|感到|觉得`)},
+	{"抽象套话『一种说不出的/的意义在于』", regexp.MustCompile(`一种说不出的|说不清[的道]|的意义在于|真正的[^。！？\n]{1,10}是`)},
 }
 
 var (
@@ -200,7 +205,7 @@ func validGram(gram []rune) bool {
 }
 
 // stopwordBigrams 把专有名词拆成 2 字片段：人名常以部分形式入文
-//（"九渊负手"含"九渊"），按整名匹配会漏网。宁可过滤偏严——短语事实少一条
+// （"九渊负手"含"九渊"），按整名匹配会漏网。宁可过滤偏严——短语事实少一条
 // 无碍，人名混进口头禅清单才是噪声。
 func stopwordBigrams(stopwords []string) []string {
 	var grams []string
@@ -233,18 +238,13 @@ func repeatedSentences(chapters []string) []SentenceStat {
 	}
 	seen := make(map[string]*rec)
 	for ci, text := range chapters {
-		for _, sent := range sentenceSplit.Split(text, -1) {
-			// 剥掉包裹引号再归并：同一句台词带/不带前引号不应算成两条
-			sent = strings.Trim(strings.TrimSpace(sent), `"“”‘’「」『』`)
-			if len([]rune(sent)) < 12 {
-				continue
-			}
+		for sent, count := range chapterSentenceCounts(text) {
 			r := seen[sent]
 			if r == nil {
 				r = &rec{chapters: make(map[int]struct{})}
 				seen[sent] = r
 			}
-			r.count++
+			r.count += count
 			r.chapters[ci] = struct{}{}
 		}
 	}
@@ -266,6 +266,11 @@ func repeatedSentences(chapters []string) []SentenceStat {
 		out = out[:5]
 	}
 	return out
+}
+
+// trimWrappedQuotes 剥掉包裹引号：同一句台词带/不带前引号不应算成两条。
+func trimWrappedQuotes(sentence string) string {
+	return strings.Trim(strings.TrimSpace(sentence), `"“”‘’「」『』`)
 }
 
 func endingShape(chapters []string) EndingStat {

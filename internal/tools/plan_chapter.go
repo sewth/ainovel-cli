@@ -33,7 +33,7 @@ func (t *PlanChapterTool) ConcurrencySafe(_ json.RawMessage) bool { return false
 func (t *PlanChapterTool) Schema() map[string]any {
 	return schema.Object(
 		schema.Property("chapter", schema.Int("章节号")).Required(),
-		schema.Property("title", schema.String("章节标题")).Required(),
+		schema.Property("title", schema.String("暂定章节标题；写作后可按正文调整")).Required(),
 		schema.Property("goal", schema.String("本章目标")).Required(),
 		schema.Property("conflict", schema.String("核心冲突")).Required(),
 		schema.Property("hook", schema.String("章末钩子")).Required(),
@@ -57,7 +57,11 @@ func (t *PlanChapterTool) Execute(_ context.Context, args json.RawMessage) (json
 	if plan.Chapter <= 0 {
 		return nil, fmt.Errorf("chapter must be > 0: %w", errs.ErrToolArgs)
 	}
-	if t.store.Progress.IsChapterCompleted(plan.Chapter) {
+	completed, err := t.store.Progress.IsChapterCompleted(plan.Chapter)
+	if err != nil {
+		return nil, fmt.Errorf("load progress: %w: %w", errs.ErrStoreRead, err)
+	}
+	if completed {
 		return json.Marshal(map[string]any{
 			"chapter":   plan.Chapter,
 			"skipped":   true,

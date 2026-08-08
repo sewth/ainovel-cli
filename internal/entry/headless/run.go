@@ -18,7 +18,6 @@ import (
 
 type Options struct {
 	Prompt string
-	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 }
@@ -35,22 +34,24 @@ func Run(cfg bootstrap.Config, bundle assets.Bundle, opts Options) error {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	stdin := opts.Stdin
-	if stdin == nil {
-		stdin = os.Stdin
-	}
-
 	eng, err := host.New(cfg, bundle)
 	if err != nil {
 		return err
 	}
-	eng.AskUser().SetHandler(newTerminalAskUser(stdin, stderr).handle)
-	cleanup := logger.SetupFile(eng.Dir(), "headless.log", false)
+	cleanup, err := logger.SetupFile(eng.Dir(), "headless.log", false)
+	if err != nil {
+		fmt.Fprintf(stderr, "警告：文件日志不可用，继续使用终端日志：%v\n", err)
+		cleanup = func() {}
+	}
 	defer cleanup()
 	defer eng.Close()
 	// 运行结束 / 出错返回时落一份脱敏诊断，方便 headless 用户贴 issue。
 	// （外部 kill 的挂死不走 defer，仍需在 TUI 里手动 /diag。）
-	defer func() { _, _ = diag.Export(store.NewStore(eng.Dir())) }()
+	defer func() {
+		if _, err := diag.Export(store.NewStore(eng.Dir())); err != nil {
+			fmt.Fprintf(stderr, "警告：诊断报告导出失败：%v\n", err)
+		}
+	}()
 
 	prompt := strings.TrimSpace(opts.Prompt)
 	if prompt != "" {
@@ -64,7 +65,11 @@ func Run(cfg bootstrap.Config, bundle assets.Bundle, opts Options) error {
 			return err
 		}
 		fmt.Fprintf(stderr, "headless 启动: %s\n", eng.Dir())
-		if err := eng.StartPrepared(plan.StartPrompt); err != nil {
+		// 启动侧确定性生成本书用户规则快照（用原始 prompt 归一化），须在 StartPrepared 前。
+		if err := eng.PrepareUserRules(plan.RawPrompt); err != nil {
+			return err
+		}
+		if err := eng.StartPrepared(plan.RawPrompt); err != nil {
 			return err
 		}
 	} else {

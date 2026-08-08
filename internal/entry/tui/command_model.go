@@ -6,8 +6,19 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/voocel/agentcore"
 	"github.com/voocel/ainovel-cli/internal/host"
 )
+
+type modelRuntime interface {
+	ConfiguredProviders() []string
+	ConfiguredModelOptions(provider string) []host.ConfiguredModel
+	CurrentModelSelection(role string) (string, string, bool)
+	AvailableThinking(role string) []agentcore.ThinkingLevel
+	CurrentThinking(role string) string
+	SwitchModel(role, provider, model string) error
+	SetRoleThinking(role, level string) error
+}
 
 type modelSwitchFocus int
 
@@ -25,7 +36,7 @@ type modelRoleOption struct {
 
 var modelRoleOptions = []modelRoleOption{
 	{Key: "default", Label: "默认"},
-	{Key: "coordinator", Label: "Coordinator"},
+
 	{Key: "architect", Label: "Architect"},
 	{Key: "writer", Label: "Writer"},
 	{Key: "editor", Label: "Editor"},
@@ -36,7 +47,6 @@ type thinkingOption struct{ Key, Label string }
 var allThinkingOptions = []thinkingOption{
 	{"", "默认(继承)"},
 	{"off", "关闭"},
-	{"minimal", "最小"},
 	{"low", "低"},
 	{"medium", "中"},
 	{"high", "高"},
@@ -44,7 +54,7 @@ var allThinkingOptions = []thinkingOption{
 	{"max", "最高"},
 }
 
-func thinkingOptionsFor(rt *host.Host, role string) []thinkingOption {
+func thinkingOptionsFor(rt modelRuntime, role string) []thinkingOption {
 	levels := rt.AvailableThinking(role)
 	if len(levels) == 0 {
 		return []thinkingOption{allThinkingOptions[0]}
@@ -82,12 +92,15 @@ type modelSwitchState struct {
 	modelIdx    int
 	thinkingIdx int
 	providers   []string
-	models      []string
+	models      []host.ConfiguredModel
 	thinking    []thinkingOption
-	message     string
+	// initialThinkingKey 记录面板打开时该角色强度字段的初始选中值。仅当用户实际移动了
+	// 该字段才回写——存储的强度意图可能高于当前模型能力、面板无法呈现，不能因“没动”而误抹。
+	initialThinkingKey string
+	message            string
 }
 
-func newModelSwitchState(rt *host.Host, roleHint string) *modelSwitchState {
+func newModelSwitchState(rt modelRuntime, roleHint string) *modelSwitchState {
 	state := &modelSwitchState{
 		providers: rt.ConfiguredProviders(),
 	}
@@ -110,7 +123,7 @@ func normalizeRoleKey(role string) string {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case "", "default":
 		return "default"
-	case "coordinator", "architect", "writer", "editor":
+	case "architect", "writer", "editor":
 		return strings.ToLower(strings.TrimSpace(role))
 	default:
 		return ""
@@ -136,7 +149,18 @@ func (s *modelSwitchState) model() string {
 	if len(s.models) == 0 || s.modelIdx < 0 || s.modelIdx >= len(s.models) {
 		return ""
 	}
-	return s.models[s.modelIdx]
+	return s.models[s.modelIdx].Name
+}
+
+func (s *modelSwitchState) modelLabel() string {
+	if len(s.models) == 0 || s.modelIdx < 0 || s.modelIdx >= len(s.models) {
+		return ""
+	}
+	model := s.models[s.modelIdx]
+	if window := formatContextWindow(model.ContextWindow); window != "" {
+		return model.Name + " · " + window
+	}
+	return model.Name
 }
 
 func (s *modelSwitchState) thinkingKey() string {
@@ -158,7 +182,7 @@ func (s *modelSwitchState) moveFocus(delta int) {
 	s.focus = modelSwitchFocus((int(s.focus) + delta + total) % total)
 }
 
-func (s *modelSwitchState) cycle(delta int, rt *host.Host) {
+func (s *modelSwitchState) cycle(delta int, rt modelRuntime) {
 	switch s.focus {
 	case modelFocusRole:
 		total := len(modelRoleOptions)
@@ -186,7 +210,7 @@ func (s *modelSwitchState) cycle(delta int, rt *host.Host) {
 	}
 }
 
-func (s *modelSwitchState) syncSelection(rt *host.Host) {
+func (s *modelSwitchState) syncSelection(rt modelRuntime) {
 	provider, model, _ := rt.CurrentModelSelection(s.role())
 	if len(s.providers) > 0 {
 		s.providerIdx = 0
@@ -202,43 +226,46 @@ func (s *modelSwitchState) syncSelection(rt *host.Host) {
 	s.message = ""
 }
 
-func (s *modelSwitchState) syncModels(rt *host.Host, preferred string) {
-	s.models = rt.ConfiguredModels(s.provider())
+func (s *modelSwitchState) syncModels(rt modelRuntime, preferred string) {
+	s.models = rt.ConfiguredModelOptions(s.provider())
 	s.modelIdx = 0
 	if len(s.models) == 0 {
 		return
 	}
 	preferred = strings.TrimSpace(preferred)
 	for i, model := range s.models {
-		if model == preferred {
+		if model.Name == preferred {
 			s.modelIdx = i
 			return
 		}
 	}
 }
 
-func (s *modelSwitchState) syncThinking(rt *host.Host) {
+func (s *modelSwitchState) syncThinking(rt modelRuntime) {
 	s.thinking = thinkingOptionsFor(rt, s.role())
 	s.thinkingIdx = thinkingIndexOf(s.thinking, rt.CurrentThinking(s.role()))
+	s.initialThinkingKey = s.thinkingKey()
 }
 
-func (s *modelSwitchState) apply(rt *host.Host) error {
+func (s *modelSwitchState) apply(rt modelRuntime) error {
 	if len(s.providers) == 0 {
 		return fmt.Errorf("当前没有可用 provider")
 	}
 	if len(s.models) == 0 {
 		return fmt.Errorf("provider %q 没有已配置模型", s.provider())
 	}
+	wantThinking := s.thinkingKey()
 	if err := rt.SwitchModel(s.role(), s.provider(), s.model()); err != nil {
 		return err
 	}
-	s.syncThinking(rt)
-	// 思考强度与模型正交：仅当较当前值有变化时应用，避免冗余持久化/事件。
-	if want := s.thinkingKey(); want != strings.ToLower(strings.TrimSpace(rt.CurrentThinking(s.role()))) {
-		if err := rt.SetRoleThinking(s.role(), want); err != nil {
+	// 推理强度与模型正交：仅当用户实际移动了强度字段才回写，避免把面板无法呈现的
+	// 高意图（当前模型能力不足）误抹成初始默认值。
+	if wantThinking != s.initialThinkingKey {
+		if err := rt.SetRoleThinking(s.role(), wantThinking); err != nil {
 			return err
 		}
 	}
+	s.syncThinking(rt)
 	return nil
 }
 
@@ -288,8 +315,8 @@ func renderModelSwitchBar(width int, state *modelSwitchState) string {
 
 	row1 := renderModelField("角色", state.roleLabel(), state.focus == modelFocusRole)
 	row2 := renderModelField("Provider", state.provider(), state.focus == modelFocusProvider)
-	row3 := renderModelField("模型", state.model(), state.focus == modelFocusModel)
-	row4 := renderModelField("思考", state.thinkingLabel(), state.focus == modelFocusThinking)
+	row3 := renderModelField("模型", state.modelLabel(), state.focus == modelFocusModel)
+	row4 := renderModelField("推理强度", state.thinkingLabel(), state.focus == modelFocusThinking)
 	hint := lipgloss.NewStyle().
 		Foreground(colorDim).
 		Italic(true).
